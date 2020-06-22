@@ -42,10 +42,7 @@ unsigned char key[16] = {
     0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
 };
 
-unsigned char iv[16] = {
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-};
+unsigned char iv[16];
 
 EventQueue ev_queue(100 * EVENTS_EVENT_SIZE);
 
@@ -66,20 +63,23 @@ RawSerial   pc(PC_12, PD_2, 115200); //Serial_5
 
 TFT_ILI9163C tft(PB_15, PB_14, PB_13, PC_6, PC_4, PA_7);
 
-DigitalOut rs_control(PC_2);
+Watchdog &watchdog = Watchdog::get_instance();
 
 SerialHandler ser(0);
 SIM800 sim800(PB_7, PC_9);
 TinyGPS GPS;
 
-SDBlockDevice sd(SD_MOSI, SD_MISO, SD_SCLK, SD_CS);
+SDBlockDevice sd(SD_MOSI, SD_MISO, SD_SCLK, SD_CS, 500000);
 FATFileSystem fs("fs");
 
+DigitalOut rs_control(PC_2);
 DigitalOut led(PA_8, 1);
 DigitalIn next_button(PA_15);
 DigitalIn prev_button(PB_6);
+DigitalIn power(PB_2, PullDown);
 AnalogIn rtu_adc_1(PC_1);
 AnalogIn rtu_adc_2(PC_3);
+AnalogIn batt_volt(PB_0);
 
 char arduino_buffer[ARDUINO_BUFFER_SIZE];
 int arduino_buffer_index = 0;
@@ -107,33 +107,50 @@ bool arduino_cli_result_ready = false;
 bool next_ready = false;
 bool prev_ready = false;
 bool on_battery = false;
+bool one_time_gps_sent = false;
+bool screen = true;
+bool is_gps_parser_free = true;
+bool is_arduino_parser_free = true;
 
 float lat, lon;
-int sd_log_interval = 300; //s
-int data_sms_interval = 600; //s
-int data_post_interval = 600; //s
+int sd_log_interval = 300000; // ms
+int data_sms_interval = 600000; //ms
+int data_post_interval = 600000; // ms
 int write_percip_interval = 300; //s
-int status_update_cnt = 0;
+int update_check_interval = 3600000;
+int update_retry_interval = 600000;
+int cnt = 0;
+int led_cnt = 0;
+int batt_state = -1;
 time_t last_data_timestamp = 0;
 time_t last_log_timestamp = 0;
 time_t last_gps_timestamp = 0;
-
 time_t last_log_time = 0;
 time_t last_data_sms_time = 0;
 time_t last_gps_sms_time = 0;
 time_t last_post_time = 0;
+time_t last_update_check = 0;
+time_t last_lcd_op = 0;
+time_t pc_connect_time = 0;
 
 string phone_no_1 = "";
 string phone_no_2 = "";
 string gprs_url = "http://gw.abfascada.ir/ahv_rtu/GetData.php";
-string device_id = "00000";
-int firmware_version = 1;
-int temp_firmware_version;
+string device_id = "000000";
+double firmware_version = 1.5;
+double temp_firmware_version;
 bool created_file = false;
 char disp[50];
 
 char temp_buffer[1500];
-char post_buffer[3500];
+unsigned char input[1510];
+unsigned char output[1510];
+char post_buffer[4000];
+char sms_buffer[1000];
+char ch[1360];
+char filename[30];
+char data_buffer[300];
+char sec_st[4], min_st[4], hr_st[4],day_st[4],month_st[4],year_st[4];
 
 struct sensor_t{
     string name;
@@ -153,19 +170,64 @@ struct sensor_t{
     int warning;
 } sensor[SENSOR_COUNT];
 
+void show_battery(){
+    if(!screen){
+        return;
+    }
+    if(batt_state != -1){
+        int x = 90, y = 3;
+        if(batt_state == 3){
+            tft.drawRGBBitmap(x, y, full_bat, 10, 23);
+        }
+        else if(batt_state == 2){
+            tft.drawRGBBitmap(x, y, medium_bat, 10, 23);
+        }
+        else if(batt_state == 1){
+            tft.drawRGBBitmap(x, y, low_bat, 10, 23);
+        }
+    }
+}
+
+void draw_footer(){
+    if(!screen){
+        return;
+    }
+    tft.drawRGBBitmap(0, 130, alt_wide, 160, 38);
+    tft.setFont(&calibril_5);
+    tft.setTextSize(1);
+    tft.setTextColor(BLACK);
+    tft.setCursor(100, 157);
+    sprintf(disp,"fw:%.1f",firmware_version);
+    tft.print(disp);
+}
+
+void show_gsm_state(bool state){
+    if(!screen){
+        return;
+    }
+    if(state){
+        tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+    }
+    else{
+        tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+    }
+}
+
 void generate_random_iv(int sz, unsigned char* iv){
     srand((unsigned int)time(NULL));
     for (size_t i = 0; i < sz; i++){
-        iv[i] = rand() % 255;
+        int r = rand();
+        iv[i] = r % 255;
     }
 }
 
 void show_date_time(){
-    if(!time_set){
+    if(!time_set || !screen){
+        ev_queue.call_in(30000, show_date_time);
         return;
     }
     time_t seconds = time(NULL);
-    char sec_st[4],min_st[4],hr_st[4],day_st[4],month_st[4],year_st[4];
+    last_lcd_op = seconds;
     strftime(min_st, 32, "%M", localtime(&seconds));
     strftime(sec_st, 32, "%S", localtime(&seconds));
     strftime(hr_st, 32, "%H", localtime(&seconds));
@@ -175,7 +237,7 @@ void show_date_time(){
     int x = 3, y = 10;
     tft.setFont(&calibril_5);
     tft.setTextSize(1);
-    tft.fillRect(0,0,100,20,BLACK); 
+    tft.fillRect(0,0,85,20,BLACK); 
 
     tft.setTextColor(WHITE);
 
@@ -186,10 +248,29 @@ void show_date_time(){
     tft.setCursor(x+45, y);
     sprintf(disp,"%s:%s",hr_st,min_st);
     tft.print(disp);
-    
+    ev_queue.call_in(30000, show_date_time);
+}
+
+void status_update(string mystr){
+    if(!screen){
+        return;
+    }
+    last_lcd_op = time(NULL);
+    int x = 35, y = 144;
+    tft.setCursor(x, y);
+    tft.fillRect(x,y-6,128,9,BLACK);
+    tft.setTextSize(1);
+    tft.setFont(&calibril_5);
+    tft.setTextColor(YELLOW);
+    tft.setCursor(x, y);
+    sprintf(disp, "%s", mystr.c_str());
+    tft.print(disp);
 }
 
 void show_sensor_data(){
+    if(!screen){
+        return;
+    }
     tft.fillRect(0,20,10,17,BLACK);
     tft.setFont(&calibril_5);
     tft.setCursor(3, 27);
@@ -259,16 +340,15 @@ void show_sensor_data(){
     }
 }
 
-void status_update(string mystr){
-    int x = 35, y = 144;
-    tft.setCursor(x, y);
-    tft.fillRect(x,y-6,128,9,BLACK);
-    tft.setTextSize(1);
-    tft.setFont(&calibril_5);
-    tft.setTextColor(YELLOW);
-    tft.setCursor(x, y);
-    sprintf(disp, "%s", mystr.c_str());
-    tft.print(disp);
+void update_lcd(){
+    screen = true;
+    show_sensor_data();
+    show_date_time();
+    show_battery();
+    show_gsm_state(sim800.sim_registered);
+    draw_footer();
+    status_update("Running...");
+    last_lcd_op = time(NULL);
 }
 
 void init_lcd(){
@@ -276,9 +356,6 @@ void init_lcd(){
     tft.setBitrate(50000000);
     tft.setRotation(2);
     tft.clearScreen();
-    tft.drawRGBBitmap(0, 130, alt_wide, 160, 38); 
-    tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
-    status_update("Initializing...")
 }
 
 void logg(const char *fmt, ...){
@@ -286,15 +363,25 @@ void logg(const char *fmt, ...){
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
-    va_start(args, fmt);
     if(sd_available){
-        FILE *file = fopen("/fs/log.txt", "a");
+        time_t seconds = time(NULL);
+        
+        strftime(min_st, 32, "%M", localtime(&seconds));
+        strftime(sec_st, 32, "%S", localtime(&seconds));
+        strftime(hr_st, 32, "%H", localtime(&seconds));
+        strftime(day_st, 32, "%d", localtime(&seconds));
+        strftime(month_st, 32, "%m", localtime(&seconds));
+        strftime(year_st, 32, "%y", localtime(&seconds));
+        sprintf(filename, "/fs/log/%s-%s-%s_%s.txt", year_st, month_st, day_st, hr_st);
+        FILE *file = fopen(filename, "a");
         if(file){
+            fprintf(file, "%s-%s-%s %s:%s:%s -> ", year_st, month_st, day_st, hr_st, min_st, sec_st);
+            va_start(args, fmt);
             vfprintf(file, fmt, args);
             fclose(file);
+            va_end(args);
         }
     }
-    va_end(args);
 }
 
 int check_sim800(){
@@ -308,7 +395,7 @@ int check_sim800(){
     }
     int retries = 0, r = 0;
     while(retries < SIM800_RETRIES){
-        bool sim_registered = false;
+        Watchdog::get_instance().kick();
         logg("Registering sim800 on the network...");
         sim800.disable();
         wait_us(100000);
@@ -316,11 +403,13 @@ int check_sim800(){
         wait_us(100000);
         sim800.power_key();
         while(r < 20){
+            Watchdog::get_instance().kick();
             sim800.AT_CREG(READ_CMND, false);
             string data(sim800.data);
-            if(data.compare("0,1") == 0){
+            if(data.compare("0,1") == 0 || data.compare("0,5") == 0){
                 logg("Done\r\n");
                 sim800.ATEx(0);
+                sim800.sim_registered = true;
                 wait_us(1000000);
                 return 0;
             }
@@ -334,35 +423,13 @@ int check_sim800(){
     return -1;
 }
 
-void parse_gps_data(){
-    logg("\r\n\r\nFrom parse_gps_data\r\n");
-	GPS.f_get_position(&lat, &lon);
-    if(lat == TinyGPS::GPS_INVALID_F_ANGLE || lon == TinyGPS::GPS_INVALID_F_ANGLE){
-        logg("GPS Invalid Angle\r\n");
-        return;
-    }
-    logg("LAT=%f", lat);
-    logg(" LON=%f\r\n", lon);
-    if(time_set){
-        last_gps_timestamp = time(NULL);
-    }
-    valid_location = true;
-}
-
-void gps_rx(){
-	char c = gps.getc();
-	if(GPS.encode(c)){
-		ev_queue.call(parse_gps_data);
-	}
-}
-
 void send_gps_sms(){
     logg("\r\n\r\nFrom send_gps_sms:\r\n");
     if(!valid_location){
         logg("location not available!\r\n");
-        ev_queue.call_in(60000, send_gps_sms);
         return;
     }
+
     bool phone_1 = false, phone_2 = false;
     if(phone_no_1.length() > 0){
         phone_1 = true;
@@ -374,20 +441,56 @@ void send_gps_sms(){
         logg("No phone numbers entered!");
         return;
     }
+    status_update("Sending sms...");
     if(check_sim800() != 0){
         logg("Could not register SIM800 on network");
         return;
     }
+    Watchdog::get_instance().kick();
     char text[70];
-    strftime(text, 10, "%H:%M:%S", localtime(&last_gps_timestamp));
-    sprintf(text, "%s-> device location: (%f, %f)", text, lat, lon);
+    char temp[10];
+    strftime(temp, 10, "%H:%M:%S", localtime(&last_gps_timestamp));
+    sprintf(text, "%s: %s-> device location: (%f, %f)", temp, device_id.c_str(), lat, lon);
     sim800.AT_CMGF(WRITE_CMND, 1);
+    sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
     if(phone_1){
         sim800.AT_CMGS(WRITE_CMND, phone_no_1, text);
     }
     if(phone_2){
         sim800.AT_CMGS(WRITE_CMND, phone_no_2, text);
     }
+    one_time_gps_sent = true;
+    status_update("Done.");
+}
+
+void parse_gps_data(){
+    logg("\r\n\r\nFrom parse_gps_data\r\n");
+	GPS.f_get_position(&lat, &lon);
+    if(lat == TinyGPS::GPS_INVALID_F_ANGLE || lon == TinyGPS::GPS_INVALID_F_ANGLE){
+        logg("GPS Invalid Angle\r\n");
+        is_gps_parser_free = true;
+        return;
+    }
+    logg("LAT=%f", lat);
+    logg(" LON=%f\r\n", lon);
+    if(time_set){
+        last_gps_timestamp = time(NULL);
+    }
+    valid_location = true;
+    is_gps_parser_free = true;
+    if(!one_time_gps_sent){
+        ev_queue.call(send_gps_sms);
+    }
+}
+
+void gps_rx(){
+	char c = gps.getc();
+	if(GPS.encode(c)){
+        if(is_gps_parser_free){
+            is_gps_parser_free = false;
+            ev_queue.call(parse_gps_data);
+        }
+	}
 }
 
 int string_to_double(string s, double* d){
@@ -455,15 +558,15 @@ int string_to_int(string str, int* d){
     return 0;
 }
 
-int8_t hex_ch_to_int(char ch){
-    if(ch <= '9' && ch >= '0'){
-        return ch - '0';
+int8_t hex_ch_to_int(char chr){
+    if(chr <= '9' && chr >= '0'){
+        return chr - '0';
     }
-    if(ch >= 'A' && ch <= 'F'){
-        return ch - 'A' + 10;
+    if(chr >= 'A' && chr <= 'F'){
+        return chr - 'A' + 10;
     }
-    if(ch >= 'a' && ch <= 'f'){
-        return ch - 'a' + 10;
+    if(chr >= 'a' && chr <= 'f'){
+        return chr - 'a' + 10;
     }
     return -1;
 }
@@ -510,7 +613,6 @@ void get_time(){
     logg("\r\n\r\nFrom get_time\r\n");
     status_update("Sync time...");
     int retries = 3, result;
-    char data_buffer[50];
     int data_len = 0;
     while(retries > 0){
         if(check_sim800() != 0){
@@ -519,18 +621,19 @@ void get_time(){
             status_update("Failed");
             return;
         }
-        tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+        Watchdog::get_instance().kick();
+        show_gsm_state(true);
         sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
         sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
         sim800.AT_HTTPINIT(EXEC_CMND);
         sim800.AT_HTTPPARA(WRITE_CMND, "CID", "1");
-        sim800.AT_HTTPPARA(WRITE_CMND, "URL", "optimems.net/Hajmi/settings.php");
+        sim800.AT_HTTPPARA(WRITE_CMND, "URL", "http://gw.abfascada.ir/ahv_rtu/settings.php");
         wait_us(100000);
         result = sim800.AT_SAPBR(WRITE_CMND, 1, 1);
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         wait_us(100000);
@@ -538,7 +641,7 @@ void get_time(){
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
 
@@ -546,7 +649,7 @@ void get_time(){
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         break;
@@ -578,9 +681,8 @@ void get_time(){
 
 void parse_config_xml(TiXmlDocument doc){
     logg("\r\r\nFrom parse_config_xml:\r\n");
-
     string tag = doc.RootElement()->Value();
-
+    
     for (TiXmlNode* child = doc.RootElement()->FirstChild(); child; child = child->NextSibling() ) {
         if (child->Type()==TiXmlNode::TINYXML_ELEMENT) {
             tag = child->Value();
@@ -611,7 +713,7 @@ void parse_config_xml(TiXmlDocument doc){
                             if(string_to_int(text, &tmp) != 0){
                                 continue;
                             }
-                            data_sms_interval = tmp * 60;
+                            data_sms_interval = tmp * 60000;
                             logg("loaded data_sms_interval = %d\r\n", data_sms_interval);
                         }
                     }
@@ -631,7 +733,7 @@ void parse_config_xml(TiXmlDocument doc){
                             if(string_to_int(text, &tmp) != 0){
                                 continue;
                             }
-                            data_post_interval = tmp * 60;
+                            data_post_interval = tmp * 60000;
                             logg("loaded data_post_interval = %d\r\n", data_post_interval);
                         }
                     }
@@ -725,6 +827,7 @@ void parse_config_xml(TiXmlDocument doc){
             }
         }
     }
+    status_update("Done");
 }
 
 void serial_menu(){
@@ -737,8 +840,8 @@ void serial_menu(){
     string data(menu_parse_buffer);
     if(data.compare("connect") == 0){
         new_serial_data = false;
-        logg("{\"device_id\":\"%s\", \"firmware_version\":\"%d\"}\r\n", device_id.c_str(), firmware_version);
-        rs_menu.printf("{\"device_id\":\"%s\", \"firmware_version\":\"%d\"}\n", device_id.c_str(), firmware_version);
+        logg("{\"device_id\":\"%s\", \"firmware_version\":\"%.1f\"}\r\n", device_id.c_str(), firmware_version);
+        rs_menu.printf("{\"device_id\":\"%s\", \"firmware_version\":\"%.1f\"}\n", device_id.c_str(), firmware_version);
         menu_running = true;
     }
     arduino_cli_ready = false;
@@ -746,6 +849,7 @@ void serial_menu(){
     int cntr = 0;
     status_update("Connected to pc");
     while(true){
+        Watchdog::get_instance().kick();
         if(new_serial_data){
             cntr = 0;
             new_serial_data = false;
@@ -764,6 +868,7 @@ void serial_menu(){
                     cntr = 0;
                     continue;
                 }
+                Watchdog::get_instance().kick();
                 TiXmlDocument doc;
                 FILE* file = fopen("/fs/config.xml", "r");
                 doc.LoadFile(file);
@@ -776,6 +881,7 @@ void serial_menu(){
                 cntr = 0;
             }
             else if(data[0] == '<'){
+                Watchdog::get_instance().kick();
                 TiXmlDocument doc;
                 doc.Parse(data.c_str());
                 parse_config_xml(doc);
@@ -798,6 +904,7 @@ void serial_menu(){
                 logg("Waiting for response\r\n");
                 int timeout = 55;
                 while(!arduino_cli_result_ready){
+                    Watchdog::get_instance().kick();
                     logg(".\r\n");
                     wait_us(1000000);
                     timeout--;
@@ -827,6 +934,7 @@ void serial_menu(){
                 logg("Waiting for response\r\n");
                 int timeout = 55;
                 while(!arduino_cli_result_ready){
+                    Watchdog::get_instance().kick();
                     logg(".\r\n");
                     wait_us(1000000);
                     timeout--;
@@ -859,6 +967,7 @@ void serial_menu(){
                 logg("Waiting for response\r\n");
                 int timeout = 55;
                 while(!arduino_cli_result_ready){
+                    Watchdog::get_instance().kick();
                     logg(".\r\n");
                     wait_us(1000000);
                     timeout--;
@@ -874,6 +983,17 @@ void serial_menu(){
                 rs_menu.printf("%s\n", arduino_buffer);
                 arduino_cli_result_ready = false;
                 cntr = 0;
+            }
+            else if(data.compare("get_sensor_data") == 0){
+                cntr = 0;
+                rs_menu.printf("<data>");
+                for(int i = 0;i < SENSOR_COUNT;i++){
+                    if(sensor[i].valid_fun){
+                        rs_menu.printf("<%s>%s</%s>", sensor[i].name.c_str(), sensor[i].scaled_value.c_str(), sensor[i].name.c_str());
+                    }
+                }
+                rs_menu.printf("</data>");
+                rs_menu.putc('\n');
             }
         }
         wait_us(100000);
@@ -935,11 +1055,98 @@ void init_SD(){
 	int err = fs.mount(&sd);
 	if (err) {
 		logg("Failed!\r\n");
+        status_update("No SD Card");
+        wait_us(100000);
+        return;
 	}
 	else{
 		logg("Done\r\n");
 		sd_available = true;
 	}
+
+    logg("Cheking for \"log\" directory...");
+    DIR *d = opendir("/fs/log");
+    if(d){
+        logg("Exists.\r\n");
+    }
+    else{
+        logg("Doesn't exist!\r\n Creating directory \"log\"...");
+        int rs = mkdir("/fs/log", 777);
+        if(rs == 0){
+            logg("Done.\r\n");
+        }
+        else{
+            logg("Failed with %d code\r\n", rs);
+            return;
+        }
+    }
+
+    logg("Cheking for \"percip\" directory...");
+    d = opendir("/fs/percip");
+    if(d){
+        logg("Exists.\r\n");
+    }
+    else{
+        logg("Doesn't exist!\r\n Creating directory \"percip\"...");
+        int rs = mkdir("/fs/percip", 777);
+        if(rs == 0){
+            logg("Done.\r\n");
+        }
+        else{
+            logg("Failed with %d code\r\n", rs);
+            return;
+        }
+    }
+
+    logg("Cheking for \"data\" directory...");
+    d = opendir("/fs/data");
+    if(d){
+        logg("Exists.\r\n");
+    }
+    else{
+        logg("Doesn't exist!\r\n Creating directory \"data\"...");
+        int rs = mkdir("/fs/data", 777);
+        if(rs == 0){
+            logg("Done.\r\n");
+        }
+        else{
+            logg("Failed with %d code\r\n", rs);
+            return;
+        }
+    }
+    logg("Cheking for \"raw\" directory...");
+    d = opendir("/fs/data/raw");
+    if(d){
+        logg("Exists.\r\n");
+    }
+    else{
+        logg("Doesn't exist!\r\n Creating directory \"raw\"...");
+        int rs = mkdir("/fs/data/raw", 777);
+        if(rs == 0){
+            logg("Done.\r\n");
+        }
+        else{
+            logg("Failed with %d code\r\n", rs);
+            return;
+        }
+    }
+
+    logg("Cheking for \"scaled\" directory...");
+    d = opendir("/fs/data/scaled");
+    if(d){
+        logg("Exists.\r\n");
+    }
+    else{
+        logg("Doesn't exist!\r\n Creating directory \"scaled\"...");
+        int rs = mkdir("/fs/data/scaled", 777);
+        if(rs == 0){
+            logg("Done.\r\n");
+        }
+        else{
+            logg("Failed with %d code\r\n", rs);
+            return;
+        }
+    }
 }
 
 unsigned int roundUp(unsigned int numToRound, int multiple){
@@ -967,33 +1174,33 @@ void write_percip() {
         logg("SD not available!\r\n");
         return;
     }
-    char temp[30];
-    unsigned int cl = roundUp(last_data_timestamp, write_percip_interval);
-    sprintf(temp, "/fs/percip/%u.txt", cl);
-    logg("Opening file %s...", temp);
-    FILE *file = fopen(temp, "w");
-    if (!file) {
-        logg("Failed\r\n");
-        return;
-    }
-    else {
-        logg("Done\r\n");
-    }
+    
     int idx = -1;
     for(int i = 0;i < SENSOR_COUNT;i++){
         if(sensor[i].name.compare("ra") == 0){
             idx = i;
         }
     }
+
     if(idx != -1 && sensor[idx].valid_fun){
+        char temp[30];
+        unsigned int cl = roundUp(last_data_timestamp, write_percip_interval);
+        sprintf(temp, "/fs/percip/%u.txt", cl);
+        logg("Opening file %s...", temp);
+        FILE *file = fopen(temp, "w");
+        if (!file) {
+            logg("Failed\r\n");
+            return;
+        }
+        else {
+            logg("Done\r\n");
+        }
         fprintf(file, "%s", sensor[idx].scaled_value.c_str());
+        fclose(file);
     }
     else{
-        logg("Rain data not available!");
+        logg("Rain data not available!\r\n");
     }
-    
-    fclose(file);
-   
 }
 
 void read_percip_1(){
@@ -1094,69 +1301,70 @@ int check_version(){
 		if(check_sim800() != 0){
 			return -2;
 		}
-        tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+        Watchdog::get_instance().kick();
+        show_gsm_state(true);
 		result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
 	    result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         result = sim800.AT_FTPCID(WRITE_CMND, 1);
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
-        result = sim800.AT_FTPSERV(WRITE_CMND, "abfascada.ir");
+        result = sim800.AT_FTPSERV(WRITE_CMND, "optimems.net");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         result = sim800.AT_FTPPORT(WRITE_CMND, "21");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
-        result = sim800.AT_FTPUN(WRITE_CMND, "fw");
+        result = sim800.AT_FTPUN(WRITE_CMND, "fw_ftp@optimems.net");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
 
         }
-        result = sim800.AT_FTPPW(WRITE_CMND, "Miouch13!");
+        result = sim800.AT_FTPPW(WRITE_CMND, "Miouch13");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         result = sim800.AT_FTPGETPATH(WRITE_CMND, "/ahv_rtu/");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         result = sim800.AT_FTPGETNAME(WRITE_CMND, "version.txt");
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         wait_us(500000);
@@ -1164,7 +1372,7 @@ int check_version(){
         if(result != 0){
             retries--;
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
 		wait_us(1000000);
@@ -1178,7 +1386,7 @@ int check_version(){
         result = sim800.AT_FTPTYPE(WRITE_CMND, 'A');
         if(result != 0){
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             retries--;
             continue;
         }
@@ -1186,19 +1394,19 @@ int check_version(){
         result = sim800.AT_FTPGET(WRITE_CMND, 1);
         if(result != 0){
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             retries--;
             continue;
         }
-        char ch[size];
-        if(sim800.AT_FTPGET(WRITE_CMND, 2, size, ch) != 0){
+        char buffer[size];
+        if(sim800.AT_FTPGET(WRITE_CMND, 2, size, buffer) != 0){
             logg("Download failed.");
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             retries--;
             continue;
         }
-        if(string_to_int(string(ch), &temp_firmware_version) == 0){
+        if(string_to_double(string(buffer), &temp_firmware_version) == 0){
             if(temp_firmware_version > firmware_version){
                 sim800.AT_FTPQUIT(EXEC_CMND);
                 sim800.AT_SAPBR(WRITE_CMND, 0, 1);
@@ -1224,26 +1432,27 @@ int check_for_update_file(){
 	while(retries > 0){
 		if(check_sim800() != 0){
 			return -2;
-            tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+            show_gsm_state(true);
 		}
+        Watchdog::get_instance().kick();
         result = sim800.AT_FTPGETPATH(WRITE_CMND, "/ahv_rtu/");
         if(result != 0){
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             retries--;
             continue;
         }
         result = sim800.AT_FTPGETNAME(WRITE_CMND, "update.bin");
         if(result != 0){
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             retries--;
             continue;
         }
 		result = sim800.AT_SAPBR(WRITE_CMND, 1, 1);
         if(result != 0){
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             retries--;
             continue;
         }
@@ -1251,54 +1460,187 @@ int check_for_update_file(){
 		int size;
         sim800.AT_FTPSIZE(EXEC_CMND, &size);
         logg("size = %d", size);
+        result = sim800.AT_SAPBR(WRITE_CMND, 0, 1);
+        if(result != 0){
+            sim800.disable();
+            show_gsm_state(false);
+            retries--;
+            continue;
+        }
         return size;
+
 	}
 	return -1;
 }
 
 int download_update_file(int file_size){
-    int result;
-    result = sim800.AT_FTPTYPE(WRITE_CMND, 'I');
-    if(result != 0){
-        sim800.AT_SAPBR(WRITE_CMND, 0, 1);
-        return -1;
-    }
-    wait_us(500000);
-    result = sim800.AT_FTPGET(WRITE_CMND, 1);
-    if(result != 0){
-        sim800.AT_SAPBR(WRITE_CMND, 0, 1);
-        return -1;
-    }
-    wait_us(500000);
-    int blockCnt = (int)(file_size / 1360);
-    logg("Creating file update.bin...");
-    FILE *file = fopen("/fs/update.bin", "w+b");
-    if (!file) {
-        logg("Failed\r\n");
-        sim800.AT_SAPBR(WRITE_CMND, 0, 1);
-        return -2;
-    }
-    else {
-        logg("Done\r\n");
-        created_file = true;
-    }
-    char ch[sim800.FTP_SIZE];
-    for(int i = 0;i < blockCnt;i++){
-        char temp[30];
-        sprintf(temp, "Downloading %03d %%", (i * 100 / blockCnt));
-        logg("%s\r\n", temp);
-        status_update(string(temp));
-        if(sim800.AT_FTPGET(WRITE_CMND, 2, sim800.FTP_SIZE, ch) != 0){
+    int retries = 3, result;
+	while(retries > 0){
+		if(check_sim800() != 0){
+			return -2;
+		}
+        Watchdog::get_instance().kick();
+        status_update("Initiating download");
+        show_gsm_state(true);
+		result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+	    result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        wait_us(500000);
+		result = sim800.AT_SAPBR(WRITE_CMND, 1, 1);
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        result = sim800.AT_FTPCID(WRITE_CMND, 1);
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        result = sim800.AT_FTPSERV(WRITE_CMND, "optimems.net");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        result = sim800.AT_FTPPORT(WRITE_CMND, "21");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        result = sim800.AT_FTPUN(WRITE_CMND, "fw_ftp@optimems.net");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+
+        }
+        result = sim800.AT_FTPPW(WRITE_CMND, "Miouch13");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        result = sim800.AT_FTPGETPATH(WRITE_CMND, "/ahv_rtu/");
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        result = sim800.AT_FTPTYPE(WRITE_CMND, 'I');
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        wait_us(500000);
+        int blockCnt = (int)(file_size / 1360);
+        logg("Creating file update.bin...");
+        FILE *file = fopen("/fs/update.bin", "w+b");
+        if (!file) {
+            logg("Failed\r\n");
+            sim800.AT_SAPBR(WRITE_CMND, 0, 1);
+            return -2;
+        }
+        else {
+            logg("Done\r\n");
+            created_file = true;
+        }
+        bool failed = false;
+        wait_us(500000);
+        result = sim800.AT_FTPGET(WRITE_CMND, 1);
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            continue;
+        }
+        for(int i = 0;i < blockCnt;i++){
+            Watchdog::get_instance().kick();
+            char temp[30];
+            sprintf(temp, "Downloading %03d %%", (i * 100 / blockCnt));
+            logg("%s\r\n", temp);
+            status_update(string(temp));
+            if(sim800.AT_FTPGET(WRITE_CMND, 2, sim800.FTP_SIZE, ch) != 0){
+                if(file){
+                    fclose(file);
+                    remove("/fs/update.bin");
+                }
+                logg("Download failed.");
+                status_update("Download failed!");
+                retries--;
+                sim800.AT_FTPQUIT(EXEC_CMND);
+                sim800.disable();
+                show_gsm_state(false);
+                failed = true;
+                break;
+            }
+            logg("Writing %d bytes to SD card...", sim800.FTP_SIZE);
+            if(fwrite(ch, sizeof(char), sizeof(ch), file) == sim800.FTP_SIZE){
+                logg("OK\r\n");
+            }
+            else{
+                logg("Failed\r\n");
+                if(file){
+                    fclose(file);
+                }
+                sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
+                return -4;
+            }
+        }
+        if(failed){
+            status_update("Failed! Retrying");
+            continue;
+        }
+        Watchdog::get_instance().kick();
+        int left = file_size % sim800.FTP_SIZE;
+        if(sim800.AT_FTPGET(WRITE_CMND, 2, left, ch) != 0){
+            logg("Download failed.");
+            status_update("Download failed!");
             if(file){
                 fclose(file);
             }
-            logg("Download failed.");
-            status_update("Download failed!");
-            sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
-            return -3;
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            status_update("Failed! Retrying");
+            sim800.AT_FTPQUIT(EXEC_CMND);
+            continue;
         }
-        logg("Writing %d bytes to SD card...", sim800.FTP_SIZE);
-        if(fwrite(ch, sizeof(char), sizeof(ch), file) == sim800.FTP_SIZE){
+        logg("Writing %d bytes to SD card...", left);
+        if(fwrite(ch, sizeof(char), left, file) == left){
             logg("OK\r\n");
         }
         else{
@@ -1309,40 +1651,20 @@ int download_update_file(int file_size){
             sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
             return -4;
         }
-    }
-    int left = file_size % sim800.FTP_SIZE;
-    if(sim800.AT_FTPGET(WRITE_CMND, 2, left, ch) != 0){
-        logg("Download failed.");
-        status_update("Download failed!");
-        if(file){
-            fclose(file);
-        }
+        logg("Downloading 100%%");
+        status_update("Downloading 100%");
+        wait_us(500000);
+        status_update("Download Completed");
+        logg("Update file downloaded successfully.\r\n");
+        fclose(file);
         sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
-        return -3;
+        return 0;
     }
-    logg("Writing %d bytes to SD card...", left);
-    if(fwrite(ch, sizeof(char), left, file) == left){
-        logg("OK\r\n");
-    }
-    else{
-        logg("Failed\r\n");
-        if(file){
-            fclose(file);
-        }
-        sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
-        return -4;
-    }
-    logg("Downloading 100%%");
-    status_update("Downloading 100%%");
-    wait_us(500000);
-    status_update("Download Completed");
-    logg("Update file downloaded successfully.\r\n");
-    fclose(file);
-    sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
-    return 0;
+    return -1;
 }
 
 void check_for_update(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom check_for_update:\r\n");
     status_update("Checking update...");
     if(!sd_available){
@@ -1351,25 +1673,29 @@ void check_for_update(){
         return;
     }
     int result = check_version();
+    Watchdog::get_instance().kick();
     if(result != 0){
         logg("No updates\r\n");
         status_update("No update.");
+        ev_queue.call_in(update_check_interval, check_for_update);
         return;
     }
+    Watchdog::get_instance().kick();
 	result = check_for_update_file();
 	if(result < 0){
 		logg("Failed to get update file size\r\n");
         status_update("No update.");
+        ev_queue.call_in(update_check_interval, check_for_update);
 	}
 	else if(result == 0){
 		logg("update file not found\r\n");
         status_update("No update.");
+        ev_queue.call_in(update_check_interval, check_for_update);
 	}
 	else{
         status_update("update Found.");
 		int rslt = download_update_file(result);
 		if(rslt == 0){
-            firmware_version = temp_firmware_version;
             status_update("Restarting!");
             wait_us(1000000);
 			logg("Restarting to apply update.\r\n");
@@ -1378,8 +1704,9 @@ void check_for_update(){
         else{
             status_update("Download Failed!");
             wait_us(1000000);
-            status_update("Retry in 1 Minute");
-            ev_queue.call_in(60000, check_for_update);
+            status_update("Retry in 10 Minutes");
+            wait_us(1000000);
+            ev_queue.call_in(update_retry_interval, check_for_update);
             if(created_file){
                 remove("/fs/update.bin");
                 created_file = false;
@@ -1401,12 +1728,14 @@ void send_alarm_sms(bool is_high, int idx){
         logg("No phone numbers entered!");
         return;
     }
+    status_update("Sending alarm sms");
     if(check_sim800() != 0){
         logg("Could not register SIM800 on network");
-        tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+        show_gsm_state(false);
         return;
     }
-    tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+    Watchdog::get_instance().kick();
+    show_gsm_state(true);
     char text[500];
     strftime(text, 10, "%H:%M:%S", localtime(&last_data_timestamp));
 
@@ -1418,20 +1747,22 @@ void send_alarm_sms(bool is_high, int idx){
     }
 
     sim800.AT_CMGF(WRITE_CMND, 1);
+    sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
     if(phone_1){
         sim800.AT_CMGS(WRITE_CMND, phone_no_1, text);
     }
     if(phone_2){
         sim800.AT_CMGS(WRITE_CMND, phone_no_2, text);
     }
+    status_update("Done.");
 }
 
 void apply_function(int idx, double value){
-    logg("\r\n\r\nFrom apply_function to %s\r\n", sensor[idx].name.c_str());
+    // logg("\r\n\r\nFrom apply_function to %s\r\n", sensor[idx].name.c_str());
     double a, b;
     if(sensor[idx].a.length() == 0 || sensor[idx].b.length() == 0){
         sensor[idx].valid_fun = false;
-        logg("Function not defined\r\n");
+        // logg("Function not defined\r\n");
         return;
     }
     if(string_to_double(sensor[idx].a, &a) != 0){
@@ -1445,7 +1776,7 @@ void apply_function(int idx, double value){
                 }
                 else{
                     sensor[idx].valid_fun = false;
-                    logg("Dependancy not ready\r\n");
+                    // logg("Dependancy not ready\r\n");
                     return;
                 }
             }
@@ -1466,7 +1797,7 @@ void apply_function(int idx, double value){
                 }
                 else{
                     sensor[idx].valid_fun = false;
-                    logg("Dependancy not ready\r\n");
+                    // logg("Dependancy not ready\r\n");
                     return;
                 }
             }
@@ -1482,17 +1813,53 @@ void apply_function(int idx, double value){
     sensor[idx].valid_fun = true;
     double high_th, low_th;
     if(string_to_double(sensor[idx].high_th, &high_th) == 0 && sc_value > high_th){
-        logg("Alarm! %s is higher than it's threshold(%f)", sensor[idx].name.c_str(), temp);
+        // logg("Alarm! %s is higher than it's threshold(%f)", sensor[idx].name.c_str(), temp);
+        sensor[idx].warning = 11;
         ev_queue.call(send_alarm_sms, true, idx);
     }
     if(string_to_double(sensor[idx].low_th, &low_th) == 0 && sc_value < low_th){
-        logg("Alarm! %s is lower than it's threshold(%f)", sensor[idx].name.c_str(), temp);
+        // logg("Alarm! %s is lower than it's threshold(%f)", sensor[idx].name.c_str(), temp);
+        sensor[idx].warning = 10;
         ev_queue.call(send_alarm_sms, false, idx);
+    }
+}
+
+void check_power_state(){
+    on_battery = !power;
+    char temp[10];
+    double battery_voltage = batt_volt.read();
+
+    sprintf(temp, "%f", battery_voltage * 12.27);
+    sensor[21].raw_value = string(temp);
+    sensor[21].valid_raw = true;
+    apply_function(21, battery_voltage * 12.27);
+
+    if(battery_voltage > 0.71){
+        batt_state = 3;
+    }
+    else if(battery_voltage > 0.7){
+        if(batt_state == -1){
+            batt_state = 3;
+        }
+        batt_state = batt_state;
+    }
+    else if(battery_voltage > 0.61){
+        batt_state = 2;
+    }
+    else if(battery_voltage > 0.6){
+        if(batt_state == -1){
+            batt_state = 2;
+        }
+        batt_state = batt_state;
+    }
+    else{
+        batt_state = 1;
     }
 }
 
 void get_rs485_data(){
     logg("\r\n\r\nFrom get_rs485_data:\r\n");
+    Watchdog::get_instance().kick();
     int idx = -1;
     for(int i = 0;i < SENSOR_COUNT;i++){
         if(sensor[i].name.compare("rs") == 0){
@@ -1516,22 +1883,22 @@ void get_rs485_data(){
         }
     }
     logg("\r\n");
-    logg("rs485 data:\r\n", rs_receive_buffer);
-    for(int i = 1;i < 10;i++){
-        logg("%02X", rs_receive_buffer[i]);
-    }
-    logg("\r\n");
+    // logg("rs485 data:\r\n", rs_receive_buffer);
+    // for(int i = 1;i < 10;i++){
+    //     logg("%02X", rs_receive_buffer[i]);
+    // }
     int p_c = rs_receive_buffer[1] + (rs_receive_buffer[2] << 8);
     logg("peizo current = %d\r\n", p_c);
     char temp[10];
     sprintf(temp, "%d", p_c);
     sensor[idx].raw_value = string(temp);
+    sensor[idx].valid_raw = true;
     apply_function(idx, (double)p_c);
 }
 
 int check_data(string sensor_name, double value){
     if(sensor_name.compare("pt") == 0){
-        if(value > 980.0){
+        if(value > 980.0 || value < -100){
             return 2;
         }
         return 0;
@@ -1540,7 +1907,9 @@ int check_data(string sensor_name, double value){
 }
 
 void parse_arduino_data(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom parse_arduino_data:\r\n");
+    status_update("Updating sensor data");
     last_data_timestamp = time(NULL);
     TiXmlDocument doc;
     doc.Parse(arduino_buffer);
@@ -1549,6 +1918,7 @@ void parse_arduino_data(){
     doc.Accept(&printer);
     logg("%s\r\n\r\n", printer.CStr());
     for (TiXmlNode* child = doc.RootElement()->FirstChild(); child; child = child->NextSibling() ) {
+        Watchdog::get_instance().kick();
         if (child->Type()==TiXmlNode::TINYXML_ELEMENT) {
             string tag = child->Value();
             string text = string(child->ToElement()->GetText());
@@ -1568,24 +1938,34 @@ void parse_arduino_data(){
             }
         }
     }
-
-    float value = rtu_adc_1 * 3.3;
-    sensor[ARDUINO_SENSOR_COUNT].raw_value = to_string(value);
+    Watchdog::get_instance().kick();
+    float value_1 = 0, value_2 = 0;
+    for(int i = 0;i < 50;i++){
+        value_1 += rtu_adc_1;
+        value_2 += rtu_adc_2;
+        wait_us(100000);
+    }
+    value_1 = (float)(value_1 / 50 * 12.269);
+    value_2 = (float)(value_2 / 50 * 12.269);
+    
+    sensor[ARDUINO_SENSOR_COUNT].raw_value = to_string(value_1);
     sensor[ARDUINO_SENSOR_COUNT].valid_raw = true;
-    apply_function(ARDUINO_SENSOR_COUNT, (double)value);
+    apply_function(ARDUINO_SENSOR_COUNT, (double)value_1);
 
-    value = rtu_adc_2 * 3.3;
-    sensor[ARDUINO_SENSOR_COUNT+1].raw_value = to_string(value);
+    sensor[ARDUINO_SENSOR_COUNT+1].raw_value = to_string(value_2);
     sensor[ARDUINO_SENSOR_COUNT+1].valid_raw = true;
-    apply_function(ARDUINO_SENSOR_COUNT+1, (double)value);
-
+    apply_function(ARDUINO_SENSOR_COUNT+1, (double)value_2);
+    Watchdog::get_instance().kick();
     get_rs485_data();
 
     write_percip();
     read_percip_1();
     read_percip_12();
     print_sensors();
-    show_sensor_data();
+    if(screen){
+        show_sensor_data();
+    }
+    is_arduino_parser_free = true;
 }
 
 void arduino_rx(){
@@ -1618,7 +1998,10 @@ void arduino_rx(){
                     arduino_buffer[arduino_buffer_index] = '\0';
                     arduino_rx_state = 0;
                     arduino_buffer_index = 0;
-                    ev_queue.call(parse_arduino_data);
+                    if(is_arduino_parser_free){
+                        is_arduino_parser_free = false;
+                        ev_queue.call(parse_arduino_data);
+                    }
                     break;
                 }
                 if(char_compare(arduino_buffer, (char*)"/cmnd", arduino_tag_start_index, arduino_buffer_index - 2)){
@@ -1645,6 +2028,7 @@ void arduino_rx(){
 }
 
 void log_data_to_sd(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nfrom log_data_to_sd:\r\n");
     if(!sd_available){
         logg("SD not available\r\n");
@@ -1653,17 +2037,28 @@ void log_data_to_sd(){
 
     if(last_data_timestamp == 0 || last_log_timestamp == last_data_timestamp){
         logg("Data not available\r\n");
+        ev_queue.call_in(sd_log_interval, log_data_to_sd);
         return;
     }
+    status_update("Logging data on SD");
 
-    logg("Cheking for file raw_data.csv...");
-    FILE *raw_data_file = fopen("/fs/raw_data.csv", "r");
+    time_t seconds = time(NULL);
+    strftime(day_st, 32, "%d", localtime(&seconds));
+    strftime(month_st, 32, "%m", localtime(&seconds));
+    strftime(year_st, 32, "%y", localtime(&seconds));
+    char file_raw[30];
+    char file_scaled[35];
+    sprintf(file_raw, "/fs/data/raw/%s-%s-%s.csv", year_st, month_st, day_st);
+    sprintf(file_scaled, "/fs/data/scaled/%s-%s-%s.csv", year_st, month_st, day_st);
+    logg("Cheking for file %s...", file_raw);
+    FILE *raw_data_file = fopen(file_raw, "r");
     if (!raw_data_file) {
     	logg("file not created yet.\r\n");
-        logg("Creating file logg.csv with header...");
-        FILE *temp_file = fopen("/fs/raw_data.csv", "w");
+        logg("Creating file %s with header...", file_raw);
+        FILE *temp_file = fopen(file_raw, "w");
         if(!temp_file){
             logg("failed\r\n");
+            ev_queue.call_in(sd_log_interval, log_data_to_sd);
             return;
         }
         else{
@@ -1672,8 +2067,11 @@ void log_data_to_sd(){
             for(int i = 0;i < ARDUINO_SENSOR_COUNT;i++){
                 sprintf(temp, "%s,%s", temp, arduino_sensors[i].c_str());
             }
-            for(int i = ARDUINO_SENSOR_COUNT;i < SENSOR_COUNT;i++){
-                sprintf(temp, "%s,%s", temp, rtu_sensors[i - ARDUINO_SENSOR_COUNT].c_str());
+            for(int i = 0;i < RTU_SENSOR_COUNT;i++){
+                sprintf(temp, "%s,%s", temp, rtu_sensors[i].c_str());
+            }
+            for(int i=0; i<CALCULATED_DATA_COUNT;i++){
+                sprintf(temp, "%s,%s", temp, calculated_data[i].c_str());
             }
             fprintf(temp_file, "%s\r\n", temp);
             fclose(temp_file);
@@ -1686,14 +2084,15 @@ void log_data_to_sd(){
     }
     
 
-    logg("Cheking for file raw_data.csv...");
-    FILE *scaled_data_file = fopen("/fs/scaled_data.csv", "r");
+    logg("Cheking for file %s...", file_scaled);
+    FILE *scaled_data_file = fopen(file_scaled, "r");
     if (!scaled_data_file) {
     	logg("file not created yet.\r\n");
-        logg("Creating file scaled_data.csv with header...");
-        FILE *temp_file = fopen("/fs/scaled_data.csv", "w");
+        logg("Creating file %s with header...", file_scaled);
+        FILE *temp_file = fopen(file_scaled, "w");
         if(!temp_file){
             logg("failed\r\n");
+            ev_queue.call_in(sd_log_interval, log_data_to_sd);
             return;
         }
         else{
@@ -1703,8 +2102,11 @@ void log_data_to_sd(){
             for(int i = 0;i < ARDUINO_SENSOR_COUNT;i++){
                 sprintf(temp, "%s,%s", temp, arduino_sensors[i].c_str());
             }
-            for(int i = ARDUINO_SENSOR_COUNT;i < SENSOR_COUNT;i++){
-                sprintf(temp, "%s, %s", temp, rtu_sensors[i - ARDUINO_SENSOR_COUNT].c_str());
+            for(int i = 0;i < RTU_SENSOR_COUNT;i++){
+                sprintf(temp, "%s,%s", temp, rtu_sensors[i].c_str());
+            }
+            for(int i=0; i<CALCULATED_DATA_COUNT;i++){
+                sprintf(temp, "%s,%s", temp, calculated_data[i].c_str());
             }
             fprintf(temp_file, "%s\r\n", temp);
             fclose(temp_file);
@@ -1716,9 +2118,10 @@ void log_data_to_sd(){
     }
 
     logg("Writting raw data...");
-    raw_data_file = fopen("/fs/raw_data.csv", "a");
+    raw_data_file = fopen(file_raw, "a");
     if(!raw_data_file){
         logg("failed\r\n");
+        ev_queue.call_in(sd_log_interval, log_data_to_sd);
     }
     else{
         char temp[300];
@@ -1737,9 +2140,10 @@ void log_data_to_sd(){
     }
 
     logg("Writting scaled data...");
-    scaled_data_file = fopen("/fs/scaled_data.csv", "a");
+    scaled_data_file = fopen(file_scaled, "a");
     if(!scaled_data_file){
         logg("failed\r\n");
+        ev_queue.call_in(sd_log_interval, log_data_to_sd);
     }
     else{
         char temp[300];
@@ -1757,33 +2161,11 @@ void log_data_to_sd(){
         logg("Done\r\n");
     }
     last_log_timestamp = last_data_timestamp;
+    status_update("Done.");
+    ev_queue.call_in(sd_log_interval, log_data_to_sd);
 }
 
-void send_data_sms(){
-    logg("\r\n\r\nFrom send_data_sms:\r\n");
-    if(last_data_timestamp == 0){
-        logg("Data not available");
-        return;
-    }
-    bool phone_1 = false, phone_2 = false;
-    if(phone_no_1.length() > 0){
-        phone_1 = true;
-    }
-    if(phone_no_2.length() > 0){
-        phone_2 = true;
-    }
-    if(!phone_1 && !phone_2){
-        logg("No phone numbers entered!");
-        return;
-    }
-    status_update("Sending data sms...");
-    if(check_sim800() != 0){
-        logg("Could not register SIM800 on network");
-        status_update("Failed");
-        tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
-        return;
-    }
-    tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+void generate_sms_data(){
     int data_to_send_cnt = 0;
     for(int i = 0;i < SENSOR_COUNT;i++){
         if(sensor[i].send_in_sms){
@@ -1799,34 +2181,80 @@ void send_data_sms(){
         }
     } 
 
-    char text[500];
-    strftime(text, 10, "%H:%M:%S", localtime(&last_data_timestamp));
+    
+    strftime(sms_buffer, 10, "%H:%M:%S", localtime(&last_data_timestamp));
     for(int i = 0;i < data_to_send_cnt;i++){
         if(sensor[i].valid_fun){
-            sprintf(text, "%s,%s", text, sensor[i].scaled_value.c_str());
+            sprintf(sms_buffer, "%s,%s", sms_buffer, sensor[i].scaled_value.c_str());
         }
         else{
-            sprintf(text, "%s,_", text);
+            sprintf(sms_buffer, "%s,_", sms_buffer);
         }
         if(sensor[i].send_raw_in_sms && sensor[i].valid_raw){
-            sprintf(text, "%s(%s)", text, sensor[i].raw_value.c_str());
+            sprintf(sms_buffer, "%s(%s)", sms_buffer, sensor[i].raw_value.c_str());
         }
     }
+}
+
+void send_data_sms(){
+    logg("\r\n\r\nFrom send_data_sms:\r\n");
+    if(last_data_timestamp == 0){
+        logg("Data not available");
+        ev_queue.call_in(data_sms_interval, send_data_sms);
+        return;
+    }
+    bool phone_1 = false, phone_2 = false;
+    if(phone_no_1.length() > 0){
+        phone_1 = true;
+    }
+    if(phone_no_2.length() > 0){
+        phone_2 = true;
+    }
+    if(!phone_1 && !phone_2){
+        logg("No phone numbers entered!");
+        ev_queue.call_in(data_sms_interval, send_data_sms);
+        return;
+    }
+    status_update("Sending data sms...");
+    if(check_sim800() != 0){
+        logg("Could not register SIM800 on network");
+        status_update("Failed");
+        show_gsm_state(false);
+        ev_queue.call_in(data_sms_interval, send_data_sms);
+        return;
+    }
+    Watchdog::get_instance().kick();
+    show_gsm_state(true);
+
+    generate_sms_data();
+    
     sim800.AT_CMGF(WRITE_CMND, 1);
+    sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
     if(phone_1){
-        sim800.AT_CMGS(WRITE_CMND, phone_no_1, text);
+        sim800.AT_CMGS(WRITE_CMND, phone_no_1, sms_buffer);
     }
     if(phone_2){
-        sim800.AT_CMGS(WRITE_CMND, phone_no_2, text);
+        sim800.AT_CMGS(WRITE_CMND, phone_no_2, sms_buffer);
     }
     status_update("Done.");
+    ev_queue.call_in(data_sms_interval, send_data_sms);
 }
 
 void post_data(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom post_data:\r\n");
+    if(on_battery){
+        logg("on battery, not sending\r\n");
+        ev_queue.call_in(data_post_interval, post_data);
+        return;
+    }
     if(last_data_timestamp == 0){
         logg("Data not available\r\n");
+        ev_queue.call_in(data_post_interval, post_data);
         return;
+    }
+    if(!time_set){
+        get_time();
     }
     status_update("Sending data to server");
     wait_us(100000);
@@ -1840,14 +2268,20 @@ void post_data(){
     else{
         sprintf(temp_buffer, "%s,\"location\":{\"lat\":\"\", \"lon\":\"\"}", temp_buffer);
     }
+    time_t now = time(NULL);
+    if(now >= last_data_timestamp + 3600){
+        sprintf(temp_buffer, "%s,\"interface_warning\":\"1\"", temp_buffer);
+    }
+    else{
+        sprintf(temp_buffer, "%s,\"interface_warning\":\"0\"", temp_buffer);
+    }
     for(int i = 0;i < SENSOR_COUNT;i++){
-        sz = sprintf(temp_buffer, "%s,\"%s\":{\"raw\":\"%s\", \"scaled\":\"%s\", \"warning\":%d}", temp_buffer, sensor[i].name.c_str(), sensor[i].valid_raw ? sensor[i].raw_value.c_str() : "", sensor[i].valid_fun ? sensor[i].scaled_value.c_str() : "", sensor[i].warning);
+        sz = sprintf(temp_buffer, "%s,\"%s\":{\"raw\":\"%s\", \"scaled\":\"%s\", \"warning\":\"%d\"}", temp_buffer, sensor[i].name.c_str(), sensor[i].valid_raw ? sensor[i].raw_value.c_str() : "", sensor[i].valid_fun ? sensor[i].scaled_value.c_str() : "", sensor[i].warning);
     }
     temp_buffer[sz++] = '}';
     temp_buffer[sz] = '\0';
     logg("unencrypted data = %s\r\n", temp_buffer);
     const int input_size = 16 * (((int)sz/16) + 1);
-    unsigned char input[input_size];
     
     for(int i = 0;i < sz;i++){
         input[i] = temp_buffer[i];
@@ -1856,19 +2290,18 @@ void post_data(){
         input[i] = (unsigned char)input_size - sz;
     }
     
-    unsigned char output[input_size];
-    mbedtls_aes_setkey_enc(&aes, key, 128);
-    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, input_size, iv, input, output);
     status_update("Connecting to server");
     int retries = 3;
     while(retries > 0){
+        Watchdog::get_instance().kick();
         if(check_sim800() != 0){
             logg("Could not register SIM800 on network");
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             status_update("Failed");
+            ev_queue.call_in(data_post_interval, post_data);
             return;
         }
-        tft.drawRGBBitmap(106, 4, gsm_ok, 22, 22);
+        show_gsm_state(true);
         sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
         sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
         sim800.AT_HTTPINIT(EXEC_CMND);
@@ -1880,7 +2313,7 @@ void post_data(){
             retries--;
             status_update("Failed! Retrying...");
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
 
@@ -1888,35 +2321,36 @@ void post_data(){
         generate_random_iv(16, iv);
         sprintf(post_buffer, "data=");
         for(int i = 0;i<16;i++){
-            sprintf(post_buffer, "%02X", iv[i]);
+            sprintf(post_buffer, "%s%02x", post_buffer, iv[i]);
         }
+        mbedtls_aes_setkey_enc(&aes, key, 128);
+        mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, input_size, iv, input, output); 
         int l;
         for(int i = 0;i < input_size;i++){
             l = sprintf(post_buffer, "%s%02x", post_buffer, output[i]);
         }
-        logg("send = %s\r\n", post_buffer);
+        logg("send: %s\r\n", post_buffer);
         status_update("sending data...");
         if(sim800.AT_HTTPDATA(WRITE_CMND, l, 5000, post_buffer) != 0){
             retries--;
             status_update("Failed! Retrying...");
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         if(sim800.AT_HTTPACTION(WRITE_CMND, 1) != 0){
             retries--;
             status_update("Failed! Retrying...");
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         int data_len;
-        char data_buffer[300];
         if(sim800.AT_HTTPREAD(EXEC_CMND, &data_len, data_buffer) != 0){
             retries--;
             status_update("Failed! Retrying...");
             sim800.disable();
-            tft.drawRGBBitmap(106, 4, gsm_not_ok, 22, 22);
+            show_gsm_state(false);
             continue;
         }
         sim800.AT_HTTPTERM(EXEC_CMND);
@@ -1929,24 +2363,34 @@ void post_data(){
     }
     if(retries <= 0){
         status_update("Failed!");
+        ev_queue.call_in(data_post_interval, post_data);
         return;
     }
+    ev_queue.call_in(data_post_interval, post_data);
     status_update("Sent.");
 }
 
 void load_config_from_sd(){
     logg("\r\n\r\nFrom load_config_from_sd:\r\n");
-    
+    status_update("Check config file");
     if(!sd_available){
         logg("SD not available!\r\n");
+        status_update("No SD");
         return;
     }
     TiXmlDocument doc;
     FILE* file = fopen("/fs/config.xml", "r");
+    if(!file){
+        logg("config file not available");
+        status_update("file not found");
+        return;
+    }
+    status_update("Loading config file");
     doc.LoadFile(file);
     parse_config_xml(doc);
     doc.Clear();
     fclose(file);
+    status_update("Loaded config");
 }
 
 void initialize_data(){
@@ -1964,14 +2408,65 @@ void initialize_data(){
         sensor[i].name = calculated_data[i-(ARDUINO_SENSOR_COUNT+RTU_SENSOR_COUNT)];
         sensor[i].display_name = calculated_data_name[i-(ARDUINO_SENSOR_COUNT+RTU_SENSOR_COUNT)];
     }
-    if(sd_available){
-        logg("SD available, initializing data from sd\r\n");
-        status_update("Loading config...");
-        load_config_from_sd();
-        status_update("Done.");
+    load_config_from_sd();
+}
+
+void check_for_sms(){
+    logg("\r\n\r\nCheck for sms\r\n");
+    status_update("Check sms command");
+    if(check_sim800() != 0){
+        logg("Could not register SIM800 on network");
+        show_gsm_state(false);
+        ev_queue.call_in(300000, check_for_sms);
         return;
     }
-    logg("SD not available, initializing with default values\r\n");
+    show_gsm_state(true);
+    sim800.AT_CMGF(WRITE_CMND, 1);
+    for(int i=1;i<16;i++){
+        Watchdog::get_instance().kick();
+        if(sim800.AT_CMGR(WRITE_CMND, i) != 0){
+            ev_queue.call_in(300000, check_for_sms);
+            return;
+        }
+        string output(sim800.data);
+        remove(output.begin(), output.end(), '\r');
+        remove(output.begin(), output.end(), '\n');
+        for (size_t j = 0; j < 3; j++) {
+            int u = output.find("\"");
+            output = output.substr(u+1);
+        }
+        int u = output.find("\"");
+        string phone_number = output.substr(0, u);
+        for (size_t j = 0; j < 5; j++) {
+            int u = output.find("\"");
+            output = output.substr(u+1);
+        }
+        u = output.find("OK");
+        output = output.substr(0, u);
+        pc.printf("sms: %s, from %s\n", output.c_str(), phone_number.c_str());
+        sim800.AT_CMGD(WRITE_CMND, i);
+        if(output.find("#stat") == 0){
+            generate_sms_data();
+            sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
+            sim800.AT_CMGS(WRITE_CMND, phone_number, sms_buffer);
+        }
+        else if(output.find("#gp") == 0){
+            ev_queue.call(post_data);
+        }
+        else if(output.find("#qu") == 0){
+            sim800.AT_CSQ(EXEC_CMND);
+            sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
+            sim800.AT_CMGS(WRITE_CMND, phone_number, sim800.data);
+        }
+        else if(output.find("#reset") == 0){
+            NVIC_SystemReset();
+        }
+        else if(output.find("#update") == 0){
+            ev_queue.call(check_for_update);
+        }
+    }
+    status_update("Done.");
+    ev_queue.call_in(300000, check_for_sms);
 }
 
 void check_buttons(){
@@ -1990,6 +2485,9 @@ void check_buttons(){
         else{
             lcd_page_number++;
         }
+        if(on_battery){
+            ev_queue.call(update_lcd);
+        }
         ev_queue.call(show_sensor_data);
     }
 
@@ -2001,10 +2499,32 @@ void check_buttons(){
         else{
             lcd_page_number--;
         }
+        if(on_battery){
+            ev_queue.call(update_lcd);
+        }
         ev_queue.call(show_sensor_data);
     }
+    ev_queue.call_in(200, check_buttons);
 }
 
 void blink(){
-	led = !led;
+    led_cnt++;
+	if(on_battery){
+        if(led){
+            led = 0;
+        }
+        else{
+            if(led_cnt >= 20){
+                led = 1;
+                led_cnt=0;
+            }
+        }
+    }
+    else{
+        if(led_cnt >= 10){
+            led = !led;
+            led_cnt=0;
+        }
+    }
+    ev_queue.call_in(100, blink);
 }

@@ -1,4 +1,7 @@
 {
 	"target_overrides": {
+		"SAYMANTECH_RTU": {
+			"target.bootloader_img" : "bootloader.bin"
+        }
 	}
 }
