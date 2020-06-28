@@ -1,10 +1,21 @@
 #include "main.h"
 
+void update_header(){
+    if(screen){
+        show_date_time();
+        show_battery();
+    }
+    ev_queue.call_in(30000, update_header);
+}
+
 void main_loop(){
     time_t now = time(NULL);
     check_power_state();
     Watchdog::get_instance().kick();
     if(on_battery){
+        if(!one_time_gps_sent){
+            send_gps_sms();
+        }
         sim800.disable();
         if(now > last_lcd_op + 10){
             tft.clearScreen();
@@ -13,6 +24,7 @@ void main_loop(){
     }
     else{
         status_update("Running...");
+        one_time_gps_sent = false;
         if(!screen){
             update_lcd();
         }
@@ -48,6 +60,7 @@ int main(){
     status_update("Initializing. . . . .");
     rs_menu.attach(rs_menu_rx);
     status_update("Initializing. . . . . .");
+    arduino.printf("exit");
     if(arduino.readable()){
         while(arduino.readable()){
             arduino.getc();
@@ -67,12 +80,12 @@ int main(){
     ev_queue.call_in(200, check_buttons);
     ev_queue.call_in(1000, main_loop);
 
-    ev_queue.call_in(60000, check_for_update);
-    // ev_queue.call(check_for_update);
+    // ev_queue.call_in(60000, check_for_update);
+    ev_queue.call(check_for_update);
     ev_queue.call_in(sd_log_interval, log_data_to_sd);
     ev_queue.call_in(data_post_interval, post_data);
     ev_queue.call_in(data_sms_interval, send_data_sms);
-    ev_queue.call_in(30000, show_date_time);
+    ev_queue.call_in(30000, update_header);
     ev_queue.call_in(180000, check_for_sms);
 
 	ev_queue.dispatch_forever();

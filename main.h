@@ -17,8 +17,14 @@
 #include "tinyxml.h"
 #include "TinyGPS.h"
 
-#define ARDUINO_BUFFER_SIZE 500
-#define MENU_BUFFER_SIZE 3000
+#if (OS_THREAD_OBJ_MEM == 0) 
+    #define OS_THREAD_LIBSPACE_NUM 4 
+#else
+    #define OS_THREAD_LIBSPACE_NUM OS_THREAD_NUM 
+#endif
+
+#define ARDUINO_BUFFER_SIZE 1500
+#define MENU_BUFFER_SIZE 5000
 #define ARDUINO_SENSOR_COUNT 16
 #define RTU_SENSOR_COUNT 3
 #define SIM800_RETRIES 3
@@ -69,7 +75,7 @@ SerialHandler ser(0);
 SIM800 sim800(PB_7, PC_9);
 TinyGPS GPS;
 
-SDBlockDevice sd(SD_MOSI, SD_MISO, SD_SCLK, SD_CS, 500000);
+SDBlockDevice sd(SD_MOSI, SD_MISO, SD_SCLK, SD_CS, 20000000);
 FATFileSystem fs("fs");
 
 DigitalOut rs_control(PC_2);
@@ -111,6 +117,7 @@ bool one_time_gps_sent = false;
 bool screen = true;
 bool is_gps_parser_free = true;
 bool is_arduino_parser_free = true;
+bool log_to_sd = false;
 
 float lat, lon;
 int sd_log_interval = 300000; // ms
@@ -137,7 +144,7 @@ string phone_no_1 = "";
 string phone_no_2 = "";
 string gprs_url = "http://gw.abfascada.ir/ahv_rtu/GetData.php";
 string device_id = "000000";
-double firmware_version = 1.5;
+double firmware_version = 2.7;
 double temp_firmware_version;
 bool created_file = false;
 char disp[50];
@@ -146,10 +153,11 @@ char temp_buffer[1500];
 unsigned char input[1510];
 unsigned char output[1510];
 char post_buffer[4000];
-char sms_buffer[1000];
+char sms_buffer[1500];
 char ch[1360];
 char filename[30];
 char data_buffer[300];
+char download_buffer[1500];
 char sec_st[4], min_st[4], hr_st[4],day_st[4],month_st[4],year_st[4];
 
 struct sensor_t{
@@ -171,9 +179,6 @@ struct sensor_t{
 } sensor[SENSOR_COUNT];
 
 void show_battery(){
-    if(!screen){
-        return;
-    }
     if(batt_state != -1){
         int x = 90, y = 3;
         if(batt_state == 3){
@@ -222,7 +227,7 @@ void generate_random_iv(int sz, unsigned char* iv){
 }
 
 void show_date_time(){
-    if(!time_set || !screen){
+    if(!time_set){
         ev_queue.call_in(30000, show_date_time);
         return;
     }
@@ -248,7 +253,6 @@ void show_date_time(){
     tft.setCursor(x+45, y);
     sprintf(disp,"%s:%s",hr_st,min_st);
     tft.print(disp);
-    ev_queue.call_in(30000, show_date_time);
 }
 
 void status_update(string mystr){
@@ -363,9 +367,9 @@ void logg(const char *fmt, ...){
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
-    if(sd_available){
+    if(log_to_sd && sd_available){
+        Watchdog::get_instance().kick();
         time_t seconds = time(NULL);
-        
         strftime(min_st, 32, "%M", localtime(&seconds));
         strftime(sec_st, 32, "%S", localtime(&seconds));
         strftime(hr_st, 32, "%H", localtime(&seconds));
@@ -423,12 +427,41 @@ int check_sim800(){
     return -1;
 }
 
+void generate_sms_data(){
+    int data_to_send_cnt = 0;
+    for(int i = 0;i < SENSOR_COUNT;i++){
+        if(sensor[i].send_in_sms){
+            data_to_send_cnt++;
+        }
+    }
+
+    int data_idx[(const int)data_to_send_cnt];
+
+    for(int i = 0;i < SENSOR_COUNT;i++){
+        if(sensor[i].send_in_sms){
+            data_idx[sensor[i].sms_order - 1] = i;
+        }
+    } 
+
+    
+    // strftime(sms_buffer, 10, "%H:%M:%S", localtime(&last_data_timestamp));
+    sprintf(sms_buffer, "%s", device_id.c_str());
+    for(int i = 0;i < data_to_send_cnt;i++){
+        int idx = data_idx[i];
+        if(sensor[idx].valid_fun){
+            sprintf(sms_buffer, "%s,%s", sms_buffer, sensor[idx].scaled_value.c_str());
+        }
+        else{
+            sprintf(sms_buffer, "%s,_", sms_buffer);
+        }
+        if(sensor[idx].send_raw_in_sms && sensor[idx].valid_raw){
+            sprintf(sms_buffer, "%s(%s)", sms_buffer, sensor[idx].raw_value.c_str());
+        }
+    }
+}
+
 void send_gps_sms(){
     logg("\r\n\r\nFrom send_gps_sms:\r\n");
-    if(!valid_location){
-        logg("location not available!\r\n");
-        return;
-    }
 
     bool phone_1 = false, phone_2 = false;
     if(phone_no_1.length() > 0){
@@ -447,20 +480,28 @@ void send_gps_sms(){
         return;
     }
     Watchdog::get_instance().kick();
-    char text[70];
+    generate_sms_data();
     char temp[10];
     strftime(temp, 10, "%H:%M:%S", localtime(&last_gps_timestamp));
-    sprintf(text, "%s: %s-> device location: (%f, %f)", temp, device_id.c_str(), lat, lon);
+    sprintf(sms_buffer, "%s,%s", sms_buffer, temp);
+    if(valid_location){
+        sprintf(sms_buffer, "%s,%f,%f", sms_buffer, lat, lon);
+    }
+    else{
+        sprintf(sms_buffer, "%s,_,_", sms_buffer);
+    }
+
     sim800.AT_CMGF(WRITE_CMND, 1);
     sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
     if(phone_1){
-        sim800.AT_CMGS(WRITE_CMND, phone_no_1, text);
+        sim800.AT_CMGS(WRITE_CMND, phone_no_1, sms_buffer);
     }
     if(phone_2){
-        sim800.AT_CMGS(WRITE_CMND, phone_no_2, text);
+        sim800.AT_CMGS(WRITE_CMND, phone_no_2, sms_buffer);
     }
-    one_time_gps_sent = true;
     status_update("Done.");
+    one_time_gps_sent = true;
+    ev_queue.call_in(7200000, send_gps_sms);
 }
 
 void parse_gps_data(){
@@ -478,9 +519,6 @@ void parse_gps_data(){
     }
     valid_location = true;
     is_gps_parser_free = true;
-    if(!one_time_gps_sent){
-        ev_queue.call(send_gps_sms);
-    }
 }
 
 void gps_rx(){
@@ -637,7 +675,8 @@ void get_time(){
             continue;
         }
         wait_us(100000);
-        result = sim800.AT_HTTPACTION(WRITE_CMND, 0);
+        result = sim800.AT_HTTPACTION(WRITE_CMND, 0, 20000);
+        printf("action data: %s\r\n", sim800.data);
         if(result != 0){
             retries--;
             sim800.disable();
@@ -684,6 +723,7 @@ void parse_config_xml(TiXmlDocument doc){
     string tag = doc.RootElement()->Value();
     
     for (TiXmlNode* child = doc.RootElement()->FirstChild(); child; child = child->NextSibling() ) {
+        Watchdog::get_instance().kick();
         if (child->Type()==TiXmlNode::TINYXML_ELEMENT) {
             tag = child->Value();
             string text(child->ToElement()->GetText());
@@ -697,6 +737,7 @@ void parse_config_xml(TiXmlDocument doc){
             }
             else if (tag.compare("sms") == 0) {
                 for (TiXmlNode* new_child = child->FirstChild(); new_child; new_child = new_child->NextSibling() ) {
+                    Watchdog::get_instance().kick();
                     if (new_child->Type()==TiXmlNode::TINYXML_ELEMENT) {
                         tag = new_child->Value();
                         text = new_child->ToElement()->GetText();
@@ -721,6 +762,7 @@ void parse_config_xml(TiXmlDocument doc){
             }
             else if (tag.compare("gprs") == 0) {
                 for (TiXmlNode* new_child = child->FirstChild(); new_child; new_child = new_child->NextSibling() ) {
+                    Watchdog::get_instance().kick();
                     if (new_child->Type()==TiXmlNode::TINYXML_ELEMENT) {
                         tag = new_child->Value();
                         text = new_child->ToElement()->GetText();
@@ -752,17 +794,20 @@ void parse_config_xml(TiXmlDocument doc){
                             for(int i = 0;i < 16;i++){
                                 key[i] = (unsigned char)hex_string_to_byte(key_string.substr(2 * i, 2));
                             }
-                            logg("loaded encryption key = 0x");
+                            char key_temp[65];
+                            sprintf(key_temp, "loaded encryption key = 0x");
                             for(int i = 0;i<16;i++){
-                                logg("%02X", key[i]);
+                                sprintf(key_temp, "%s%02X", key_temp, key[i]);
                             }
-                            logg("\r\n");
+                            sprintf(key_temp, "%s\r\n", key_temp);
+                            logg(key_temp);
                         }
                     }
                 }
             }
             else if (tag.compare("s") == 0) {
                 for (TiXmlNode* new_child = child->FirstChild(); new_child; new_child = new_child->NextSibling() ) {
+                    Watchdog::get_instance().kick();
                     if (new_child->Type()==TiXmlNode::TINYXML_ELEMENT) {
                         logg("\r\n");
                         tag = new_child->Value();
@@ -781,9 +826,9 @@ void parse_config_xml(TiXmlDocument doc){
                             if(new_new_child->Type() == TiXmlNode::TINYXML_ELEMENT){
                                 string var = new_new_child->Value();
                                 text = new_new_child->ToElement()->GetText();
-                                if(text.length() == 0){
-                                    continue;
-                                }
+                                // if(text.length() == 0){
+                                //     continue;
+                                // }
                                 if(var.compare("u") == 0){
                                     sensor[idx].unit = text;
                                     logg("loaded %s->unit = %s\r\n", tag.c_str(), sensor[idx].unit.c_str());
@@ -802,7 +847,7 @@ void parse_config_xml(TiXmlDocument doc){
                                 }
                                 else if(var.compare("high") == 0){
                                     sensor[idx].high_th = text;
-                                    logg("loaded %s->high = %s\r\n", tag.c_str(), sensor[idx].high_th.c_str());
+                                    logg("loaded %s->high_th = %s\r\n", tag.c_str(), sensor[idx].high_th.c_str());
                                 }
                                 else if(var.compare("s_i_s") == 0){
                                     sensor[idx].send_in_sms = string_to_bool(text);
@@ -889,7 +934,8 @@ void serial_menu(){
                 doc.SaveFile(file);
                 fclose(file);
                 rs_menu.printf("OK\n");
-                cntr = 0;
+                cntr = 1800;
+                
             }
             else if(data.compare("scan_sdi") == 0){
                 if(!arduino_cli_ready){
@@ -998,7 +1044,7 @@ void serial_menu(){
         }
         wait_us(100000);
         cntr++;
-        if(cntr >= 600){
+        if(cntr >= 1800){
             menu_running = false;
             arduino.printf("exit");
             status_update("Disconnected");
@@ -1063,7 +1109,7 @@ void init_SD(){
 		logg("Done\r\n");
 		sd_available = true;
 	}
-
+     Watchdog::get_instance().kick();
     logg("Cheking for \"log\" directory...");
     DIR *d = opendir("/fs/log");
     if(d){
@@ -1164,11 +1210,117 @@ unsigned int roundUp(unsigned int numToRound, int multiple){
 void print_sensors(){
     logg("\r\n\r\nFrom print_sensors:\r\n");
     for(int i = 0;i < SENSOR_COUNT;i++){
+        Watchdog::get_instance().kick();
         logg("%s: %s(%s)\r\n", sensor[i].name.c_str(), sensor[i].scaled_value.c_str(), sensor[i].raw_value.c_str());
     }
 }
 
+void send_alarm_sms(bool is_high, int idx){
+    logg("\r\n\r\nFrom send_alarm_sms:\r\n");
+    bool phone_1 = false, phone_2 = false;
+    if(phone_no_1.length() > 0){
+        phone_1 = true;
+    }
+    if(phone_no_2.length() > 0){
+        phone_2 = true;
+    }
+    if(!phone_1 && !phone_2){
+        logg("No phone numbers entered!");
+        return;
+    }
+    status_update("Sending alarm sms");
+    if(check_sim800() != 0){
+        logg("Could not register SIM800 on network");
+        show_gsm_state(false);
+        return;
+    }
+    Watchdog::get_instance().kick();
+    show_gsm_state(true);
+    char text[500];
+    strftime(text, 10, "%H:%M:%S", localtime(&last_data_timestamp));
+    sprintf(text, "%s: %s ->", text, device_id.c_str());
+    if(is_high){
+        sprintf(text, "%s Alarm! %s's value is %s and is higher than it's high threshold: %s", text, sensor[idx].name.c_str(), sensor[idx].scaled_value.c_str(), sensor[idx].high_th.c_str());
+    }
+    else{
+        sprintf(text, "%s Alarm! %s's value is %s and is lower than it's low threshold: %s", text, sensor[idx].name.c_str(), sensor[idx].scaled_value.c_str(), sensor[idx].low_th.c_str());
+    }
+
+    sim800.AT_CMGF(WRITE_CMND, 1);
+    sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
+    if(phone_1){
+        sim800.AT_CMGS(WRITE_CMND, phone_no_1, text);
+    }
+    if(phone_2){
+        sim800.AT_CMGS(WRITE_CMND, phone_no_2, text);
+    }
+    status_update("Done.");
+}
+
+void apply_function(int idx, double value){
+    logg("\r\n\r\nFrom apply_function to %s\r\n", sensor[idx].name.c_str());
+    double a, b;
+    if(string_to_double(sensor[idx].a, &a) != 0){
+        bool got_a = false;
+        for(int i = 0; i < SENSOR_COUNT; i++){
+            if(sensor[i].name.compare(sensor[idx].a) == 0){
+                if(sensor[i].valid_fun){
+                    string_to_double(sensor[i].scaled_value, &a);
+                    got_a = true;
+                    break;
+                }
+                else{
+                    sensor[idx].valid_fun = false;
+                    logg("Dependancy not ready\r\n");
+                    return;
+                }
+            }
+        }
+        if(!got_a){
+            a = 1.0;
+        }
+    }
+
+    if(string_to_double(sensor[idx].b, &b) != 0){
+        bool got_b = false;
+        for(int i = 0; i < SENSOR_COUNT; i++){
+            if(sensor[i].name.compare(sensor[idx].b) == 0){
+                if(sensor[i].valid_fun){
+                    string_to_double(sensor[i].scaled_value, &b);
+                    got_b = true;
+                    break;
+                }
+                else{
+                    sensor[idx].valid_fun = false;
+                    logg("Dependancy not ready\r\n");
+                    return;
+                }
+            }
+        }
+        if(!got_b){
+            b = 0.0;
+        }
+    }
+    double sc_value = a * value + b;
+    char temp[10];
+    sprintf(temp, "%.2f", sc_value);
+    sensor[idx].scaled_value = string(temp);
+    sensor[idx].valid_fun = true;
+    double high_th, low_th;
+    if(string_to_double(sensor[idx].high_th, &high_th) == 0 && sc_value > high_th){
+        // logg("Alarm! %s is higher than it's threshold(%f)", sensor[idx].name.c_str(), temp);
+        sensor[idx].warning = 11;
+        ev_queue.call(send_alarm_sms, true, idx);
+    }
+    if(string_to_double(sensor[idx].low_th, &low_th) == 0 && sc_value < low_th){
+        // logg("Alarm! %s is lower than it's threshold(%f)", sensor[idx].name.c_str(), temp);
+        sensor[idx].warning = 10;
+        ev_queue.call(send_alarm_sms, false, idx);
+    }
+}
+
 void write_percip() {
+    Watchdog::get_instance().kick();
     logg("From write percip: \r\n");
     if (!sd_available) {
         logg("SD not available!\r\n");
@@ -1204,6 +1356,7 @@ void write_percip() {
 }
 
 void read_percip_1(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom read_percip_1:\r\n");
 
     if (!sd_available) {
@@ -1241,8 +1394,11 @@ void read_percip_1(){
             return;
         }
 
-        sprintf(temp, "%.2f", sc_value  - hr_1);
+        sc_value -= hr_1;
+        sprintf(temp, "%.2f", sc_value);
         sensor[idx_1].scaled_value = string(temp);
+        apply_function(idx_1, sc_value);
+        sensor[idx_1].valid_fun = true;
         logg("Got %f | %s\r\n",hr_1, sensor[idx_1].scaled_value.c_str());
         fclose(f);
     }
@@ -1250,6 +1406,7 @@ void read_percip_1(){
 }
 
 void read_percip_12(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom read_percip_12:\r\n");
 
     if (!sd_available) {
@@ -1289,6 +1446,7 @@ void read_percip_12(){
 
         sprintf(temp, "%.2f", sc_value  - hr_12);
         sensor[idx_1].scaled_value = string(temp);
+        sensor[idx_1].valid_fun = true;
         logg("Got %f | %s\r\n",hr_12, sensor[idx_1].scaled_value.c_str());
         fclose(f);
     }
@@ -1296,77 +1454,23 @@ void read_percip_12(){
 }
 
 int check_version(){
-    int retries = 3, result;
+    int retries = 3, result, version_size;
 	while(retries > 0){
 		if(check_sim800() != 0){
-			return -2;
-		}
+            show_gsm_state(false);
+            logg("Could not register SIM800 on network");
+            time_set = false;
+            status_update("Failed");
+            return -1;
+        }
         Watchdog::get_instance().kick();
         show_gsm_state(true);
-		result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-	    result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-        result = sim800.AT_FTPCID(WRITE_CMND, 1);
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-        result = sim800.AT_FTPSERV(WRITE_CMND, "optimems.net");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-        result = sim800.AT_FTPPORT(WRITE_CMND, "21");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-        result = sim800.AT_FTPUN(WRITE_CMND, "fw_ftp@optimems.net");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-
-        }
-        result = sim800.AT_FTPPW(WRITE_CMND, "Miouch13");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-        result = sim800.AT_FTPGETPATH(WRITE_CMND, "/ahv_rtu/");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
-        result = sim800.AT_FTPGETNAME(WRITE_CMND, "version.txt");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            continue;
-        }
+        sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
+        sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
+        sim800.AT_HTTPINIT(EXEC_CMND);
+        sim800.AT_HTTPPARA(WRITE_CMND, "CID", "1");
+        // sim800.AT_HTTPPARA(WRITE_CMND, "USERDATA", "\"Cache-Control\": \"no-cache\"");
+        sim800.AT_HTTPPARA(WRITE_CMND, "URL", "fw.abfascada.ir/ahv_rtu/version.php");
         wait_us(500000);
 		result = sim800.AT_SAPBR(WRITE_CMND, 1, 1);
         if(result != 0){
@@ -1375,201 +1479,120 @@ int check_version(){
             show_gsm_state(false);
             continue;
         }
-		wait_us(1000000);
-		int size = -1;
-        sim800.AT_FTPSIZE(EXEC_CMND, &size);
-        logg("size = %d\r\n", size);
-        if(size == -1){
+        wait_us(100000);
+        
+        result = sim800.AT_HTTPACTION(WRITE_CMND, 0, 20000);
+        if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            continue;
+        }
+
+        string temp_data(sim800.data);
+        int idx = temp_data.find(",");
+        temp_data = temp_data.substr(idx+1);
+
+        idx = temp_data.find(",");
+        string parse = temp_data.substr(0, idx).c_str();
+        int result_code;
+        string_to_int(parse, &result_code);
+
+        printf("result = %d\r\n", result_code);
+        if(result_code != 200){
+            sim800.AT_HTTPTERM(EXEC_CMND);
             sim800.AT_SAPBR(WRITE_CMND, 0, 1);
             return -1;
         }
-        result = sim800.AT_FTPTYPE(WRITE_CMND, 'A');
+        result = sim800.AT_HTTPREAD(EXEC_CMND, &version_size, data_buffer);
         if(result != 0){
+            retries--;
             sim800.disable();
             show_gsm_state(false);
-            retries--;
             continue;
         }
-        wait_us(500000);
-        result = sim800.AT_FTPGET(WRITE_CMND, 1);
-        if(result != 0){
-            sim800.disable();
-            show_gsm_state(false);
-            retries--;
-            continue;
-        }
-        char buffer[size];
-        if(sim800.AT_FTPGET(WRITE_CMND, 2, size, buffer) != 0){
-            logg("Download failed.");
-            sim800.disable();
-            show_gsm_state(false);
-            retries--;
-            continue;
-        }
-        if(string_to_double(string(buffer), &temp_firmware_version) == 0){
-            if(temp_firmware_version > firmware_version){
-                sim800.AT_FTPQUIT(EXEC_CMND);
-                sim800.AT_SAPBR(WRITE_CMND, 0, 1);
-                return 0;
-            }
-            else{
-                sim800.AT_FTPQUIT(EXEC_CMND);
-                sim800.AT_SAPBR(WRITE_CMND, 0, 1);
-                return -1;
-            }
+        break;
+    }
+    sim800.AT_HTTPTERM(EXEC_CMND);
+    sim800.AT_SAPBR(WRITE_CMND, 0, 1);
+    data_buffer[version_size] = '\0';
+    if(string_to_double(string(data_buffer), &temp_firmware_version) == 0){
+         printf("new version =%f\r\n", temp_firmware_version);
+        if(temp_firmware_version > firmware_version){
+            return 0;
         }
         else{
-            sim800.AT_FTPQUIT(EXEC_CMND);
-            sim800.AT_SAPBR(WRITE_CMND, 0, 1);
             return -1;
         }
-	}
+    }
+    else{
+        return -1;
+    }
     return -1;
 }
 
-int check_for_update_file(){
+int download_update_file(){
 	int retries = 3, result;
 	while(retries > 0){
 		if(check_sim800() != 0){
 			return -2;
             show_gsm_state(true);
 		}
-        Watchdog::get_instance().kick();
-        result = sim800.AT_FTPGETPATH(WRITE_CMND, "/ahv_rtu/");
-        if(result != 0){
-            sim800.disable();
-            show_gsm_state(false);
-            retries--;
-            continue;
-        }
-        result = sim800.AT_FTPGETNAME(WRITE_CMND, "update.bin");
-        if(result != 0){
-            sim800.disable();
-            show_gsm_state(false);
-            retries--;
-            continue;
-        }
-		result = sim800.AT_SAPBR(WRITE_CMND, 1, 1);
-        if(result != 0){
-            sim800.disable();
-            show_gsm_state(false);
-            retries--;
-            continue;
-        }
-		wait_us(1000000);
-		int size;
-        sim800.AT_FTPSIZE(EXEC_CMND, &size);
-        logg("size = %d", size);
-        result = sim800.AT_SAPBR(WRITE_CMND, 0, 1);
-        if(result != 0){
-            sim800.disable();
-            show_gsm_state(false);
-            retries--;
-            continue;
-        }
-        return size;
-
-	}
-	return -1;
-}
-
-int download_update_file(int file_size){
-    int retries = 3, result;
-	while(retries > 0){
-		if(check_sim800() != 0){
-			return -2;
-		}
-        Watchdog::get_instance().kick();
-        status_update("Initiating download");
+       Watchdog::get_instance().kick();
         show_gsm_state(true);
-		result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
-	    result = sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
+        sim800.AT_SAPBR(WRITE_CMND, 3, 1, "Contype", "GPRS");
+        sim800.AT_SAPBR(WRITE_CMND, 3, 1, "APN", "www");
+        sim800.AT_HTTPINIT(EXEC_CMND);
+        sim800.AT_HTTPPARA(WRITE_CMND, "CID", "1");
+        // sim800.AT_HTTPPARA(WRITE_CMND, "USERDATA", "\"Cache-Control\": \"no-cache\"");
+        char url[100];
+        sprintf(url, "fw.abfascada.ir/ahv_rtu/update_%.1f.bin", temp_firmware_version);
+        sim800.AT_HTTPPARA(WRITE_CMND, "URL", string(url));
         wait_us(500000);
 		result = sim800.AT_SAPBR(WRITE_CMND, 1, 1);
         if(result != 0){
             retries--;
             sim800.disable();
             show_gsm_state(false);
-            status_update("Failed! Retrying");
             continue;
         }
-        result = sim800.AT_FTPCID(WRITE_CMND, 1);
+        status_update("Fetching data...");
+        wait_us(100000);
+        result = sim800.AT_HTTPACTION(WRITE_CMND, 0, 120000);
         if(result != 0){
             retries--;
             sim800.disable();
             show_gsm_state(false);
-            status_update("Failed! Retrying");
             continue;
         }
-        result = sim800.AT_FTPSERV(WRITE_CMND, "optimems.net");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
-        result = sim800.AT_FTPPORT(WRITE_CMND, "21");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
-        result = sim800.AT_FTPUN(WRITE_CMND, "fw_ftp@optimems.net");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
+        printf("action data: %s\r\n", sim800.data);
+        string temp_data(sim800.data);
+        int idx = temp_data.find(",");
+        temp_data = temp_data.substr(idx+1);
 
-        }
-        result = sim800.AT_FTPPW(WRITE_CMND, "Miouch13");
-        if(result != 0){
+        idx = temp_data.find(",");
+        string parse = temp_data.substr(0, idx).c_str();
+        int result_code;
+        string_to_int(parse, &result_code);
+        temp_data = temp_data.substr(idx+1);
+
+        idx = temp_data.find("\r\n");
+        parse = temp_data.substr(0, idx).c_str();
+        int file_size;
+        string_to_int(parse, &file_size);
+    
+        printf("result = %d, file size = %d\r\n", result_code, file_size);
+        if(result_code != 200){
             retries--;
             sim800.disable();
             show_gsm_state(false);
-            status_update("Failed! Retrying");
             continue;
         }
-        result = sim800.AT_FTPGETPATH(WRITE_CMND, "/ahv_rtu/");
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
-        result = sim800.AT_FTPTYPE(WRITE_CMND, 'I');
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
-        wait_us(500000);
-        int blockCnt = (int)(file_size / 1360);
         logg("Creating file update.bin...");
         FILE *file = fopen("/fs/update.bin", "w+b");
         if (!file) {
             logg("Failed\r\n");
+            sim800.AT_HTTPTERM(EXEC_CMND);
             sim800.AT_SAPBR(WRITE_CMND, 0, 1);
             return -2;
         }
@@ -1577,38 +1600,20 @@ int download_update_file(int file_size){
             logg("Done\r\n");
             created_file = true;
         }
-        bool failed = false;
-        wait_us(500000);
-        result = sim800.AT_FTPGET(WRITE_CMND, 1);
-        if(result != 0){
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            continue;
-        }
+        int data_size = 1500;
+        int blockCnt = (int) file_size / data_size;
         for(int i = 0;i < blockCnt;i++){
-            Watchdog::get_instance().kick();
             char temp[30];
-            sprintf(temp, "Downloading %03d %%", (i * 100 / blockCnt));
+            sprintf(temp, "Downloading %02d %%", (i * 100 / blockCnt));
             logg("%s\r\n", temp);
             status_update(string(temp));
-            if(sim800.AT_FTPGET(WRITE_CMND, 2, sim800.FTP_SIZE, ch) != 0){
-                if(file){
-                    fclose(file);
-                    remove("/fs/update.bin");
-                }
-                logg("Download failed.");
-                status_update("Download failed!");
-                retries--;
-                sim800.AT_FTPQUIT(EXEC_CMND);
-                sim800.disable();
-                show_gsm_state(false);
-                failed = true;
-                break;
-            }
-            logg("Writing %d bytes to SD card...", sim800.FTP_SIZE);
-            if(fwrite(ch, sizeof(char), sizeof(ch), file) == sim800.FTP_SIZE){
+            Watchdog::get_instance().kick();
+            data_size = 1500;
+            result = sim800.AT_HTTPREAD(WRITE_CMND, &data_size, download_buffer, i * data_size, data_size);
+            
+            printf("data size = %d\r\n", data_size);
+            logg("Writing %d bytes to SD card...", data_size);
+            if(fwrite(download_buffer, sizeof(char), data_size, file) == data_size){
                 logg("OK\r\n");
             }
             else{
@@ -1616,31 +1621,17 @@ int download_update_file(int file_size){
                 if(file){
                     fclose(file);
                 }
+                sim800.AT_HTTPTERM(EXEC_CMND);
                 sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
                 return -4;
             }
         }
-        if(failed){
-            status_update("Failed! Retrying");
-            continue;
-        }
+        int left = file_size % data_size;
         Watchdog::get_instance().kick();
-        int left = file_size % sim800.FTP_SIZE;
-        if(sim800.AT_FTPGET(WRITE_CMND, 2, left, ch) != 0){
-            logg("Download failed.");
-            status_update("Download failed!");
-            if(file){
-                fclose(file);
-            }
-            retries--;
-            sim800.disable();
-            show_gsm_state(false);
-            status_update("Failed! Retrying");
-            sim800.AT_FTPQUIT(EXEC_CMND);
-            continue;
-        }
+        result = sim800.AT_HTTPREAD(WRITE_CMND, &data_size, download_buffer, file_size - left, left);
+        printf("data size = %d\r\n", data_size);
         logg("Writing %d bytes to SD card...", left);
-        if(fwrite(ch, sizeof(char), left, file) == left){
+        if(fwrite(download_buffer, sizeof(char), left, file) == left){
             logg("OK\r\n");
         }
         else{
@@ -1648,19 +1639,20 @@ int download_update_file(int file_size){
             if(file){
                 fclose(file);
             }
+            sim800.AT_HTTPTERM(EXEC_CMND);
             sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
             return -4;
         }
+        status_update("Downloading 100%%");
         logg("Downloading 100%%");
-        status_update("Downloading 100%");
         wait_us(500000);
-        status_update("Download Completed");
-        logg("Update file downloaded successfully.\r\n");
         fclose(file);
-        sim800.AT_SAPBR(WRITE_CMND, 0, 1);;
-        return 0;
+        break;
+	}
+    if(retries <= 0){
+        return -1;
     }
-    return -1;
+	return 0;
 }
 
 void check_for_update(){
@@ -1681,146 +1673,24 @@ void check_for_update(){
         return;
     }
     Watchdog::get_instance().kick();
-	result = check_for_update_file();
-	if(result < 0){
-		logg("Failed to get update file size\r\n");
-        status_update("No update.");
-        ev_queue.call_in(update_check_interval, check_for_update);
-	}
-	else if(result == 0){
-		logg("update file not found\r\n");
-        status_update("No update.");
-        ev_queue.call_in(update_check_interval, check_for_update);
-	}
-	else{
-        status_update("update Found.");
-		int rslt = download_update_file(result);
-		if(rslt == 0){
-            status_update("Restarting!");
-            wait_us(1000000);
-			logg("Restarting to apply update.\r\n");
-			NVIC_SystemReset();
-		}
-        else{
-            status_update("Download Failed!");
-            wait_us(1000000);
-            status_update("Retry in 10 Minutes");
-            wait_us(1000000);
-            ev_queue.call_in(update_retry_interval, check_for_update);
-            if(created_file){
-                remove("/fs/update.bin");
-                created_file = false;
-            }
-        }
-	}
-}
-
-void send_alarm_sms(bool is_high, int idx){
-    logg("\r\n\r\nFrom send_alarm_sms:\r\n");
-    bool phone_1 = false, phone_2 = false;
-    if(phone_no_1.length() > 0){
-        phone_1 = true;
-    }
-    if(phone_no_2.length() > 0){
-        phone_2 = true;
-    }
-    if(!phone_1 && !phone_2){
-        logg("No phone numbers entered!");
-        return;
-    }
-    status_update("Sending alarm sms");
-    if(check_sim800() != 0){
-        logg("Could not register SIM800 on network");
-        show_gsm_state(false);
-        return;
-    }
-    Watchdog::get_instance().kick();
-    show_gsm_state(true);
-    char text[500];
-    strftime(text, 10, "%H:%M:%S", localtime(&last_data_timestamp));
-
-    if(is_high){
-        sprintf(text, "%s Alarm! %s's value is %s and is higher than it's high threshold: %s", text, sensor[idx].name.c_str(), sensor[idx].scaled_value.c_str(), sensor[idx].high_th.c_str());
+    status_update("update Found.");
+    int rslt = download_update_file();
+    if(rslt == 0){
+        status_update("Restarting!");
+        wait_us(1000000);
+        logg("Restarting to apply update.\r\n");
+        NVIC_SystemReset();
     }
     else{
-        sprintf(text, "%s Alarm! %s's value is %s and is lower than it's low threshold: %s", text, sensor[idx].name.c_str(), sensor[idx].scaled_value.c_str(), sensor[idx].high_th.c_str());
-    }
-
-    sim800.AT_CMGF(WRITE_CMND, 1);
-    sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
-    if(phone_1){
-        sim800.AT_CMGS(WRITE_CMND, phone_no_1, text);
-    }
-    if(phone_2){
-        sim800.AT_CMGS(WRITE_CMND, phone_no_2, text);
-    }
-    status_update("Done.");
-}
-
-void apply_function(int idx, double value){
-    // logg("\r\n\r\nFrom apply_function to %s\r\n", sensor[idx].name.c_str());
-    double a, b;
-    if(sensor[idx].a.length() == 0 || sensor[idx].b.length() == 0){
-        sensor[idx].valid_fun = false;
-        // logg("Function not defined\r\n");
-        return;
-    }
-    if(string_to_double(sensor[idx].a, &a) != 0){
-        bool got_a = false;
-        for(int i = 0; i < SENSOR_COUNT; i++){
-            if(sensor[i].name.compare(sensor[idx].a) == 0){
-                if(sensor[i].valid_fun){
-                    string_to_double(sensor[i].scaled_value, &a);
-                    got_a = true;
-                    break;
-                }
-                else{
-                    sensor[idx].valid_fun = false;
-                    // logg("Dependancy not ready\r\n");
-                    return;
-                }
-            }
+        status_update("Download Failed!");
+        wait_us(1000000);
+        status_update("Retry in 10 Minutes");
+        wait_us(1000000);
+        ev_queue.call_in(update_retry_interval, check_for_update);
+        if(created_file){
+            remove("/fs/update.bin");
+            created_file = false;
         }
-        if(!got_a){
-            a = 1.0;
-        }
-    }
-
-    if(string_to_double(sensor[idx].b, &b) != 0){
-        bool got_b = false;
-        for(int i = 0; i < SENSOR_COUNT; i++){
-            if(sensor[i].name.compare(sensor[idx].b) == 0){
-                if(sensor[i].valid_fun){
-                    string_to_double(sensor[i].scaled_value, &b);
-                    got_b = true;
-                    break;
-                }
-                else{
-                    sensor[idx].valid_fun = false;
-                    // logg("Dependancy not ready\r\n");
-                    return;
-                }
-            }
-        }
-        if(!got_b){
-            b = 0.0;
-        }
-    }
-    double sc_value = a * value + b;
-    char temp[10];
-    sprintf(temp, "%.2f", sc_value);
-    sensor[idx].scaled_value = string(temp);
-    sensor[idx].valid_fun = true;
-    double high_th, low_th;
-    if(string_to_double(sensor[idx].high_th, &high_th) == 0 && sc_value > high_th){
-        // logg("Alarm! %s is higher than it's threshold(%f)", sensor[idx].name.c_str(), temp);
-        sensor[idx].warning = 11;
-        ev_queue.call(send_alarm_sms, true, idx);
-    }
-    if(string_to_double(sensor[idx].low_th, &low_th) == 0 && sc_value < low_th){
-        // logg("Alarm! %s is lower than it's threshold(%f)", sensor[idx].name.c_str(), temp);
-        sensor[idx].warning = 10;
-        ev_queue.call(send_alarm_sms, false, idx);
     }
 }
 
@@ -1873,6 +1743,7 @@ void get_rs485_data(){
     logg("/?* command sent\r\n");
     logg("Waiting for response\r\n");
     int timeout = 10;
+    Watchdog::get_instance().kick();
     while(!rs_data_available){
         logg(".\r\n");
         wait_us(500000);
@@ -2083,7 +1954,7 @@ void log_data_to_sd(){
         fclose(raw_data_file);
     }
     
-
+    Watchdog::get_instance().kick();
     logg("Cheking for file %s...", file_scaled);
     FILE *scaled_data_file = fopen(file_scaled, "r");
     if (!scaled_data_file) {
@@ -2116,7 +1987,7 @@ void log_data_to_sd(){
     	logg("Done\r\n");
         fclose(scaled_data_file);
     }
-
+    Watchdog::get_instance().kick();
     logg("Writting raw data...");
     raw_data_file = fopen(file_raw, "a");
     if(!raw_data_file){
@@ -2138,7 +2009,7 @@ void log_data_to_sd(){
         fclose(raw_data_file);
         logg("Done\r\n");
     }
-
+    Watchdog::get_instance().kick();
     logg("Writting scaled data...");
     scaled_data_file = fopen(file_scaled, "a");
     if(!scaled_data_file){
@@ -2163,37 +2034,6 @@ void log_data_to_sd(){
     last_log_timestamp = last_data_timestamp;
     status_update("Done.");
     ev_queue.call_in(sd_log_interval, log_data_to_sd);
-}
-
-void generate_sms_data(){
-    int data_to_send_cnt = 0;
-    for(int i = 0;i < SENSOR_COUNT;i++){
-        if(sensor[i].send_in_sms){
-            data_to_send_cnt++;
-        }
-    }
-
-    int data_idx[(const int)data_to_send_cnt];
-
-    for(int i = 0;i < SENSOR_COUNT;i++){
-        if(sensor[i].send_in_sms){
-            data_idx[sensor[i].sms_order - 1] = i;
-        }
-    } 
-
-    
-    strftime(sms_buffer, 10, "%H:%M:%S", localtime(&last_data_timestamp));
-    for(int i = 0;i < data_to_send_cnt;i++){
-        if(sensor[i].valid_fun){
-            sprintf(sms_buffer, "%s,%s", sms_buffer, sensor[i].scaled_value.c_str());
-        }
-        else{
-            sprintf(sms_buffer, "%s,_", sms_buffer);
-        }
-        if(sensor[i].send_raw_in_sms && sensor[i].valid_raw){
-            sprintf(sms_buffer, "%s(%s)", sms_buffer, sensor[i].raw_value.c_str());
-        }
-    }
 }
 
 void send_data_sms(){
@@ -2262,6 +2102,7 @@ void post_data(){
     int sz = 0;
     strftime(temp_buffer, 25, "{\"time\":\"%H:%M:%S\"", localtime(&last_data_timestamp));
     sprintf(temp_buffer, "%s,\"device_id\":\"%s\"", temp_buffer, device_id.c_str());
+    sprintf(temp_buffer, "%s,\"firmware_version\":\"%.1f\"", temp_buffer, firmware_version);
     if(valid_location){
         sprintf(temp_buffer, "%s,\"location\":{\"lat\":\"%f\", \"lon\":\"%f\"}", temp_buffer, lat, lon);
     }
@@ -2338,7 +2179,7 @@ void post_data(){
             show_gsm_state(false);
             continue;
         }
-        if(sim800.AT_HTTPACTION(WRITE_CMND, 1) != 0){
+        if(sim800.AT_HTTPACTION(WRITE_CMND, 1, 60000) != 0){
             retries--;
             status_update("Failed! Retrying...");
             sim800.disable();
@@ -2371,6 +2212,7 @@ void post_data(){
 }
 
 void load_config_from_sd(){
+    Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom load_config_from_sd:\r\n");
     status_update("Check config file");
     if(!sd_available){
@@ -2463,6 +2305,13 @@ void check_for_sms(){
         }
         else if(output.find("#update") == 0){
             ev_queue.call(check_for_update);
+        }
+        else if(output.find("#balance") == 0){
+            sim800.AT_CUSD(WRITE_CMND, 1);
+            sim800.AT_CUSD(WRITE_CMND, 1, "*555*4*3*2#");
+            sim800.AT_CUSD(WRITE_CMND, 1, "*555*1*2#");
+            sim800.AT_CSMP(WRITE_CMND, 17, 167, 0, 0);
+            sim800.AT_CMGS(WRITE_CMND, phone_number, sim800.data);
         }
     }
     status_update("Done.");
