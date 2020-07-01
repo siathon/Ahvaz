@@ -9,7 +9,10 @@ void update_header(){
 }
 
 void main_loop(){
-    time_t now = time(NULL);
+    time_t now;
+    if(time_set){
+        now = time(NULL);
+    }
     check_power_state();
     Watchdog::get_instance().kick();
     if(on_battery){
@@ -38,7 +41,7 @@ void main_loop(){
 int main(){
     watchdog.start();
     printf("\r\nFirmware version = %.1f\r\n", firmware_version);
-
+    initialize_data();
     Watchdog::get_instance().kick();
     init_lcd();
     check_power_state();
@@ -49,7 +52,7 @@ int main(){
     
     Watchdog::get_instance().kick();
     init_SD();
-    initialize_data();
+    load_config_from_sd();
     status_update("Initializing.");
 
     Watchdog::get_instance().kick();

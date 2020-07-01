@@ -144,7 +144,7 @@ string phone_no_1 = "";
 string phone_no_2 = "";
 string gprs_url = "http://gw.abfascada.ir/ahv_rtu/GetData.php";
 string device_id = "000000";
-double firmware_version = 2.7;
+double firmware_version = 2.8;
 double temp_firmware_version;
 bool created_file = false;
 char disp[50];
@@ -219,7 +219,11 @@ void show_gsm_state(bool state){
 }
 
 void generate_random_iv(int sz, unsigned char* iv){
-    srand((unsigned int)time(NULL));
+    time_t tm = 0;
+    if(time_set){
+        tm = time(NULL);
+    }
+    srand((unsigned int)tm);
     for (size_t i = 0; i < sz; i++){
         int r = rand();
         iv[i] = r % 255;
@@ -231,7 +235,10 @@ void show_date_time(){
         ev_queue.call_in(30000, show_date_time);
         return;
     }
-    time_t seconds = time(NULL);
+    time_t seconds;
+    if(time_set){
+        seconds = time(NULL);
+    }
     last_lcd_op = seconds;
     strftime(min_st, 32, "%M", localtime(&seconds));
     strftime(sec_st, 32, "%S", localtime(&seconds));
@@ -259,7 +266,9 @@ void status_update(string mystr){
     if(!screen){
         return;
     }
-    last_lcd_op = time(NULL);
+    if(time_set){
+        last_lcd_op = time(NULL);
+    }
     int x = 35, y = 144;
     tft.setCursor(x, y);
     tft.fillRect(x,y-6,128,9,BLACK);
@@ -352,7 +361,9 @@ void update_lcd(){
     show_gsm_state(sim800.sim_registered);
     draw_footer();
     status_update("Running...");
-    last_lcd_op = time(NULL);
+    if(time_set){
+        last_lcd_op = time(NULL);
+    }
 }
 
 void init_lcd(){
@@ -369,7 +380,10 @@ void logg(const char *fmt, ...){
     va_end(args);
     if(log_to_sd && sd_available){
         Watchdog::get_instance().kick();
-        time_t seconds = time(NULL);
+        time_t seconds;
+        if(time_set){
+            seconds = time(NULL);
+        }
         strftime(min_st, 32, "%M", localtime(&seconds));
         strftime(sec_st, 32, "%S", localtime(&seconds));
         strftime(hr_st, 32, "%H", localtime(&seconds));
@@ -678,6 +692,23 @@ void get_time(){
         result = sim800.AT_HTTPACTION(WRITE_CMND, 0, 20000);
         printf("action data: %s\r\n", sim800.data);
         if(result != 0){
+            retries--;
+            sim800.disable();
+            show_gsm_state(false);
+            continue;
+        }
+
+        string temp_data(sim800.data);
+        int idx = temp_data.find(",");
+        temp_data = temp_data.substr(idx+1);
+
+        idx = temp_data.find(",");
+        string parse = temp_data.substr(0, idx).c_str();
+        int result_code;
+        string_to_int(parse, &result_code);
+
+        printf("result = %d\r\n", result_code);
+        if(result_code != 200){
             retries--;
             sim800.disable();
             show_gsm_state(false);
@@ -1258,7 +1289,7 @@ void send_alarm_sms(bool is_high, int idx){
 }
 
 void apply_function(int idx, double value){
-    logg("\r\n\r\nFrom apply_function to %s\r\n", sensor[idx].name.c_str());
+    logg("\r\n\r\nFrom apply_function to %s:\r\n", sensor[idx].name.c_str());
     double a, b;
     if(string_to_double(sensor[idx].a, &a) != 0){
         bool got_a = false;
@@ -1280,7 +1311,7 @@ void apply_function(int idx, double value){
             a = 1.0;
         }
     }
-
+    
     if(string_to_double(sensor[idx].b, &b) != 0){
         bool got_b = false;
         for(int i = 0; i < SENSOR_COUNT; i++){
@@ -1367,7 +1398,10 @@ void read_percip_1(){
         logg("Time is not set!");
         return;
     }
-    time_t time_stamp = time(NULL);
+    time_t time_stamp;
+    if(time_set){
+        time_stamp = time(NULL);
+    }
     unsigned int cl1 = roundUp(time_stamp - 3600, write_percip_interval);
     char temp[30];
     sprintf(temp, "/fs/percip/%u.txt", cl1);
@@ -1417,7 +1451,11 @@ void read_percip_12(){
         logg("Time is not set!");
         return;
     }
-    time_t time_stamp = time(NULL);
+    time_t time_stamp;
+    if(time_set){
+        time_t time_stamp = time(NULL);
+    }
+    
     unsigned int cl1 = roundUp(time_stamp - 43200, write_percip_interval);
     char temp[30];
     sprintf(temp, "/fs/percip/%u.txt", cl1);
@@ -1781,7 +1819,9 @@ void parse_arduino_data(){
     Watchdog::get_instance().kick();
     logg("\r\n\r\nFrom parse_arduino_data:\r\n");
     status_update("Updating sensor data");
-    last_data_timestamp = time(NULL);
+    if(time_set){
+        last_data_timestamp = time(NULL);
+    }
     TiXmlDocument doc;
     doc.Parse(arduino_buffer);
     logg("Received data: ");
@@ -1912,8 +1952,11 @@ void log_data_to_sd(){
         return;
     }
     status_update("Logging data on SD");
-
-    time_t seconds = time(NULL);
+    time_t seconds;
+    if(time_set){
+        seconds = time(NULL);
+    }
+    
     strftime(day_st, 32, "%d", localtime(&seconds));
     strftime(month_st, 32, "%m", localtime(&seconds));
     strftime(year_st, 32, "%y", localtime(&seconds));
@@ -2109,7 +2152,10 @@ void post_data(){
     else{
         sprintf(temp_buffer, "%s,\"location\":{\"lat\":\"\", \"lon\":\"\"}", temp_buffer);
     }
-    time_t now = time(NULL);
+    time_t now;
+    if(time_set){
+        now = time(NULL);
+    }
     if(now >= last_data_timestamp + 3600){
         sprintf(temp_buffer, "%s,\"interface_warning\":\"1\"", temp_buffer);
     }
@@ -2236,7 +2282,7 @@ void load_config_from_sd(){
 }
 
 void initialize_data(){
-    logg("\r\n\r\nFrom initialize_sata:");
+    logg("\r\n\r\nFrom initialize_data:\r\n");
 
     for(int i = 0;i < ARDUINO_SENSOR_COUNT;i++){
         sensor[i].name = arduino_sensors[i];
@@ -2250,7 +2296,6 @@ void initialize_data(){
         sensor[i].name = calculated_data[i-(ARDUINO_SENSOR_COUNT+RTU_SENSOR_COUNT)];
         sensor[i].display_name = calculated_data_name[i-(ARDUINO_SENSOR_COUNT+RTU_SENSOR_COUNT)];
     }
-    load_config_from_sd();
 }
 
 void check_for_sms(){
